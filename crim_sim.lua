@@ -1,4 +1,4 @@
--- crim_sim.lua  v6 — event-driven cache, no more Workspace rescans
+-- crim_sim.lua  v7 — __namecall anticheat silencer + anti-kick + rubberband-rollback + velocity speed
 -- loader:
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/d32650131-jpg/crim_sim.lua/main/crim_sim.lua", true))()
 
@@ -9,6 +9,8 @@ local Workspace         = game:GetService("Workspace")
 local Lighting          = game:GetService("Lighting")
 local VirtualUser       = game:GetService("VirtualUser")
 local TweenService      = game:GetService("TweenService")
+local GuiService        = game:GetService("GuiService")
+local StarterGui        = game:GetService("StarterGui")
 
 local LP     = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
@@ -21,12 +23,14 @@ local S = {
     SpeedBoost=false, InfStamina=false, FallProtect=false,
     Fullbright=false, AntiAFK=true,
     GrabNearbyLoot=false, BringLoot=false,
+    -- bypass
+    AntiCheatBlock=true, AntiKick=true, AntiRubberband=false, SilentWarnings=true,
 }
-local SPEED_VAL       = 22     -- live-tunable via slider (default safe-ish for anticheat)
-local SPEED_MIN       = 16
-local SPEED_MAX       = 80
-local ESP_UPDATE_RATE = 0.5    -- how often ESP labels refresh (seconds)
-local ESP_MAX_DIST    = 1500   -- studs; farther objects get no highlight to save GPU
+
+local SPEED_VAL = 28
+local SPEED_MIN, SPEED_MAX = 16, 100
+local ESP_UPDATE_RATE = 0.5
+local ESP_MAX_DIST    = 1500
 local GRAB_RADIUS     = 22
 local BRING_RADIUS    = 400
 
@@ -55,6 +59,20 @@ local CAMERA_NAMES = {"camera","cctv","securitycam"}
 local TRUCK_NAMES  = {"truck","van","armored"}
 local TASER_NAMES  = {"taser","stun","shock","tazed","ragdoll"}
 
+-- outbound RemoteEvent/RemoteFunction names to swallow (catches CheckSpeed / AntiFly / Report / Detection / ValidatePosition / Telemetry / Heartbeat / AntiExploit variants)
+local AC_BLOCK = {
+    "anticheat","antiexploit","antifly","antispeed","antinoclip","antiteleport",
+    "detect","detection","report","reportclient","reportexploit",
+    "flag","flagplayer","exploitflag",
+    "check","checkspeed","checkposition","checkpos","checkvelocity","walkspeedcheck","speedcheck","poscheck",
+    "validate","validation","validateposition","validatespeed",
+    "kick","kickplayer","forcekick","banplayer","ban","punish","moderation",
+    "trust","integrity","telemetry","heartbeatcheck","sanitycheck",
+    "securitycheck","securityevent","clientcheck","gameguard",
+    "hitcheck","flycheck","noclipcheck","teleportcheck","aimbotcheck",
+    "watchdog","snitch","observer","audit",
+}
+
 local function matchAny(nameLower, words)
     for _, w in ipairs(words) do if nameLower:find(w, 1, true) then return true end end
     return false
@@ -70,7 +88,7 @@ gui.Parent = gethui and gethui() or game:GetService("CoreGui")
 getgenv().__CRIM_SIM_GUI = gui
 
 local root = Instance.new("Frame", gui)
-root.Size=UDim2.new(0,360,0,560); root.Position=UDim2.new(0,60,0.5,-280)
+root.Size=UDim2.new(0,360,0,620); root.Position=UDim2.new(0,60,0.5,-310)
 root.BackgroundColor3=Color3.fromRGB(14,16,22); root.BorderSizePixel=0
 root.Active=true; root.Draggable=true
 Instance.new("UICorner", root).CornerRadius=UDim.new(0,12)
@@ -82,7 +100,7 @@ Instance.new("UICorner", header).CornerRadius=UDim.new(0,12)
 local title=Instance.new("TextLabel", header)
 title.BackgroundTransparency=1; title.Size=UDim2.new(1,-20,1,0); title.Position=UDim2.new(0,14,0,0)
 title.Font=Enum.Font.GothamBold; title.TextSize=15; title.TextColor3=Color3.fromRGB(235,235,245)
-title.TextXAlignment=Enum.TextXAlignment.Left; title.Text="CRIM SIM v6   ·   [Insert] toggle"
+title.TextXAlignment=Enum.TextXAlignment.Left; title.Text="CRIM SIM v7   ·   [Insert] toggle"
 
 local scroll=Instance.new("ScrollingFrame", root)
 scroll.Size=UDim2.new(1,-16,1,-58); scroll.Position=UDim2.new(0,8,0,50)
@@ -122,34 +140,28 @@ local function makeAction(labelText, cb)
     Instance.new("UICorner", row).CornerRadius=UDim.new(0,8)
     row.MouseButton1Click:Connect(function() pcall(cb) end)
 end
-
 local function makeSlider(labelText, minV, maxV, defV, onChange)
     local row=Instance.new("Frame", scroll)
     row.Size=UDim2.new(1,-8,0,46); row.BackgroundColor3=Color3.fromRGB(22,25,34); row.BorderSizePixel=0
     Instance.new("UICorner", row).CornerRadius=UDim.new(0,8)
-
     local lbl=Instance.new("TextLabel", row)
     lbl.BackgroundTransparency=1; lbl.Size=UDim2.new(1,-20,0,20); lbl.Position=UDim2.new(0,12,0,2)
     lbl.Font=Enum.Font.Gotham; lbl.TextSize=12; lbl.TextColor3=Color3.fromRGB(215,218,228)
     lbl.TextXAlignment=Enum.TextXAlignment.Left
     lbl.Text = string.format("%s: %d", labelText, defV)
-
     local track=Instance.new("Frame", row)
     track.Size=UDim2.new(1,-24,0,8); track.Position=UDim2.new(0,12,0,28)
     track.BackgroundColor3=Color3.fromRGB(45,50,62); track.BorderSizePixel=0
     Instance.new("UICorner", track).CornerRadius=UDim.new(1,0)
-
     local fill=Instance.new("Frame", track)
     fill.BackgroundColor3=Color3.fromRGB(70,150,255); fill.BorderSizePixel=0
     fill.Size=UDim2.new((defV-minV)/(maxV-minV), 0, 1, 0)
     Instance.new("UICorner", fill).CornerRadius=UDim.new(1,0)
-
     local knob=Instance.new("TextButton", track)
     knob.Size=UDim2.new(0,14,0,14); knob.AnchorPoint=Vector2.new(0.5,0.5)
     knob.Position=UDim2.new((defV-minV)/(maxV-minV), 0, 0.5, 0)
     knob.BackgroundColor3=Color3.fromRGB(235,235,245); knob.AutoButtonColor=false; knob.Text=""
     Instance.new("UICorner", knob).CornerRadius=UDim.new(1,0)
-
     local dragging=false
     local function setFromX(x)
         local abs = track.AbsolutePosition.X
@@ -192,12 +204,114 @@ table.insert(CONN, UserInputService.InputBegan:Connect(function(input, gp)
 end))
 
 ----------------------------------------------------------------
--- EVENT-DRIVEN CACHE (one-time workspace walk, then DescendantAdded hooks)
+-- __namecall hook: swallow anticheat FireServer/InvokeServer by name,
+-- swallow :Kick() calls when AntiKick is on.
+-- catches server-side invariant checker, position delta, velocity delta
 ----------------------------------------------------------------
--- cache sets: inst -> true
+local _hookmm = hookmetamethod or (getgenv and getgenv().hookmetamethod)
+local _getnc  = getnamecallmethod or (getgenv and getgenv().getnamecallmethod)
+local _check  = checkcaller or function() return false end
+
+local origNamecall
+if _hookmm then
+    origNamecall = _hookmm(game, "__namecall", function(self, ...)
+        local method = _getnc and _getnc() or ""
+        if not _check() then
+            if S.AntiCheatBlock and (method == "FireServer" or method == "InvokeServer") then
+                local okN, n = pcall(function() return self.Name:lower() end)
+                local okF, f = pcall(function() return self:GetFullName():lower() end)
+                if okN then
+                    for _, w in ipairs(AC_BLOCK) do
+                        if n:find(w, 1, true) or (okF and f:find(w, 1, true)) then
+                            if method == "InvokeServer" then return nil end
+                            return
+                        end
+                    end
+                end
+            end
+            if S.AntiKick and method == "Kick" then
+                return
+            end
+        end
+        return origNamecall(self, ...)
+    end)
+end
+
+-- also neuter LocalPlayer.Kick via raw-metatable swap (covers games that call it through player instance ref)
+pcall(function()
+    local old_mt = getrawmetatable(LP)
+    if old_mt then
+        setreadonly(old_mt, false)
+        local origIndex = old_mt.__index
+        old_mt.__index = function(t, k)
+            if k == "Kick" and S.AntiKick then
+                return function() end
+            end
+            return origIndex(t, k)
+        end
+        setreadonly(old_mt, true)
+    end
+end)
+
+-- silence server-sent kick/warn UI
+pcall(function()
+    local origSet
+    origSet = hookfunction(StarterGui.SetCore, function(self, kind, ...)
+        if S.SilentWarnings and (kind == "SendNotification" or kind == "ChatMakeSystemMessage") then
+            return
+        end
+        return origSet(self, kind, ...)
+    end)
+end)
+
+-- strip any kick-popup GUIs injected by the server
+local function nukeKickGuis()
+    local pg = LP:FindFirstChildOfClass("PlayerGui"); if not pg then return end
+    for _, g in ipairs(pg:GetChildren()) do
+        local n = g.Name:lower()
+        if n:find("kick") or n:find("ban") or n:find("exploit") or n:find("anticheat") or n:find("detect") then
+            if S.SilentWarnings then pcall(function() g:Destroy() end) end
+        end
+    end
+end
+table.insert(CONN, LP:WaitForChild("PlayerGui").ChildAdded:Connect(function(c)
+    task.wait()
+    if S.SilentWarnings then
+        local n = c.Name:lower()
+        if n:find("kick") or n:find("ban") or n:find("exploit") or n:find("anticheat") or n:find("detect") then
+            pcall(function() c:Destroy() end)
+        end
+    end
+end))
+
+-- kill client-side anticheat connections (watchdog callbacks the game registered on your client)
+local function wipeACConnections()
+    if not getconnections then return end
+    local function scan(obj)
+        for _, sig in ipairs({"DescendantAdded","ChildAdded","Heartbeat","Stepped","RenderStepped"}) do
+            local s = obj[sig]
+            if typeof(s) == "RBXScriptSignal" then
+                for _, con in ipairs(getconnections(s)) do
+                    local f = con.Function or con.func
+                    local name = ""
+                    pcall(function() name = tostring(f):lower() end)
+                    if name:find("anticheat") or name:find("detect") or name:find("exploit") or name:find("report") then
+                        pcall(function() con:Disable() end)
+                    end
+                end
+            end
+        end
+    end
+    pcall(function() scan(RunService) end)
+    pcall(function() scan(Workspace) end)
+end
+
+----------------------------------------------------------------
+-- cache (event-driven)
+----------------------------------------------------------------
 local setPolice, setGuards, setNpcs = {}, {}, {}
 local setLoot, setCamera, setTruck   = {}, {}, {}
-local glassBackup                    = {}  -- part -> original CanCollide
+local glassBackup                    = {}
 local setPrompts                     = {}
 
 local function inFolder(inst, folderName)
@@ -205,7 +319,6 @@ local function inFolder(inst, folderName)
     if not f then return false end
     return inst:IsDescendantOf(f)
 end
-
 local function classify(inst)
     if inst:IsA("Model") then
         if inst:FindFirstChildOfClass("Humanoid") then
@@ -220,8 +333,7 @@ local function classify(inst)
         end
     elseif inst:IsA("BasePart") then
         local n = inst.Name:lower()
-        if matchAny(n, LOOT_NAMES) then
-            setLoot[inst]=true
+        if matchAny(n, LOOT_NAMES) then setLoot[inst]=true
         elseif matchAny(n, GLASS_NAMES) then
             if glassBackup[inst]==nil then glassBackup[inst] = inst.CanCollide end
         end
@@ -239,37 +351,25 @@ local function unclassify(inst)
         glassBackup[inst] = nil
     end
 end
-
--- initial walk (yields every N instances so no freeze)
 local function initialWalk()
     local i = 0
     for _, d in ipairs(Workspace:GetDescendants()) do
-        classify(d)
-        i = i + 1
+        classify(d); i = i + 1
         if i % 800 == 0 then task.wait() end
     end
 end
-
--- live hooks
-table.insert(CONN, Workspace.DescendantAdded:Connect(function(d)
-    classify(d)
-end))
-table.insert(CONN, Workspace.DescendantRemoving:Connect(function(d)
-    unclassify(d)
-end))
+table.insert(CONN, Workspace.DescendantAdded:Connect(function(d) classify(d) end))
+table.insert(CONN, Workspace.DescendantRemoving:Connect(function(d) unclassify(d) end))
 
 ----------------------------------------------------------------
--- ESP (incremental, distance-culled)
+-- ESP
 ----------------------------------------------------------------
 local espFolder=Instance.new("Folder", Workspace); espFolder.Name="__CRIM_ESP"
-local espByInst = {}  -- inst -> {hl, bb, color, label}
-
+local espByInst = {}
 local function getPrimary(inst)
     if inst:IsA("Model") then return inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart") end
     if inst:IsA("BasePart") then return inst end
-    return nil
 end
-
 local function addHL(inst, color, label)
     if espByInst[inst] and espByInst[inst].hl.Parent then return end
     local h=Instance.new("Highlight")
@@ -298,7 +398,6 @@ local function removeAllHL()
     for inst, _ in pairs(espByInst) do removeHL(inst) end
     for _, c in ipairs(espFolder:GetChildren()) do c:Destroy() end
 end
-
 local function syncESP()
     local wanted = {}
     local pos = (hrp() and hrp().Position) or Vector3.new()
@@ -308,8 +407,7 @@ local function syncESP()
             if inst and inst.Parent then
                 local p = getPrimary(inst)
                 if p and (p.Position - pos).Magnitude <= ESP_MAX_DIST then
-                    wanted[inst] = true
-                    addHL(inst, color, label)
+                    wanted[inst] = true; addHL(inst, color, label)
                 end
             end
         end
@@ -320,11 +418,9 @@ local function syncESP()
     addSet(setLoot,   Color3.fromRGB(255,220,70), "LOOT",   S.LootESP)
     addSet(setCamera, Color3.fromRGB(255,60,160), "CAM",    S.CameraESP)
     addSet(setTruck,  Color3.fromRGB(120,255,120),"TRUCK",  S.TruckESP)
-
     for inst, _ in pairs(espByInst) do
         if not wanted[inst] then removeHL(inst) end
     end
-
     for _, c in ipairs(espFolder:GetChildren()) do if c.Name=="cone" then c:Destroy() end end
     if S.RedViewCones then
         for m, _ in pairs(setPolice) do
@@ -357,7 +453,6 @@ local noiseLbl=Instance.new("TextLabel", meterGui)
 noiseLbl.BackgroundTransparency=1; noiseLbl.Size=UDim2.new(1,-16,0,24); noiseLbl.Position=UDim2.new(0,8,0,32)
 noiseLbl.Font=Enum.Font.GothamBold; noiseLbl.TextSize=12; noiseLbl.TextXAlignment=Enum.TextXAlignment.Left
 noiseLbl.TextColor3=Color3.fromRGB(255,180,60); noiseLbl.Text="NOISE      0%"
-
 local function updateMeters()
     meterGui.Visible = S.DetectionMeter or S.NoiseMeter
     detLbl.Visible=S.DetectionMeter; noiseLbl.Visible=S.NoiseMeter
@@ -399,7 +494,6 @@ local function tickAntiTaser(dt)
     if atTick < 0.25 then return end
     atTick = 0
     local c = char(); local h = hum(); if not c or not h then return end
-
     if h.PlatformStand then h.PlatformStand=false end
     local st=h:GetState()
     if st==Enum.HumanoidStateType.Ragdoll or st==Enum.HumanoidStateType.FallingDown
@@ -408,7 +502,6 @@ local function tickAntiTaser(dt)
     end
     h:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
     h:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
-
     for _, v in ipairs(c:GetChildren()) do
         local n = v.Name:lower()
         if matchAny(n, TASER_NAMES) then
@@ -420,7 +513,7 @@ local function tickAntiTaser(dt)
 end
 
 ----------------------------------------------------------------
--- stealth
+-- stealth + fullbright
 ----------------------------------------------------------------
 local stealthRestore = {}
 local function setStealth(on)
@@ -442,10 +535,6 @@ local function setStealth(on)
         stealthRestore = {}
     end
 end
-
-----------------------------------------------------------------
--- fullbright
-----------------------------------------------------------------
 local lightingBackup
 local function setFullbright(on)
     if on then
@@ -466,27 +555,22 @@ local function setFullbright(on)
 end
 
 ----------------------------------------------------------------
--- speed (hook)
+-- VELOCITY SPEED — WalkSpeed stays at base, we just add velocity in move direction.
+-- walkspeed-property check won't fire; velocity-delta checks still might above ~35 — keep slider in 22-32.
 ----------------------------------------------------------------
 local baseSpeed = 16
-local speedConn
-local function hookSpeed()
-    if speedConn then speedConn:Disconnect(); speedConn=nil end
-    local h = hum(); if not h then return end
-    if h.WalkSpeed ~= SPEED_VAL then baseSpeed = h.WalkSpeed end
-    speedConn = h:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
-        if S.SpeedBoost and h.WalkSpeed ~= SPEED_VAL then
-            h.WalkSpeed = SPEED_VAL
-        end
-    end)
+local function applySpeedEveryFrame()
+    if not S.SpeedBoost then return end
+    local h = hum(); local r = hrp(); if not h or not r then return end
+    local move = h.MoveDirection
+    if move.Magnitude < 0.05 then return end
+    local v = r.AssemblyLinearVelocity
+    local horizontal = move * SPEED_VAL
+    r.AssemblyLinearVelocity = Vector3.new(horizontal.X, v.Y, horizontal.Z)
 end
-local function tickMovement()
+local function tickMovement(dt)
     local h=hum(); local r=hrp(); if not h or not r then return end
-    if S.SpeedBoost then
-        if h.WalkSpeed ~= SPEED_VAL then h.WalkSpeed = SPEED_VAL end
-    else
-        if h.WalkSpeed == SPEED_VAL then h.WalkSpeed = baseSpeed end
-    end
+    applySpeedEveryFrame()
     if S.FallProtect then
         local v=r.AssemblyLinearVelocity
         if v.Y < -60 then r.AssemblyLinearVelocity = Vector3.new(v.X, -5, v.Z) end
@@ -494,7 +578,31 @@ local function tickMovement()
 end
 
 ----------------------------------------------------------------
--- stamina
+-- ANTI-RUBBERBAND — ring buffer of local positions; if server snaps you back > 12 studs
+-- toward a point you were at >0.3s ago, re-apply forward CFrame.
+-- defeats naive position-rollback replies from server-side invariant checker.
+----------------------------------------------------------------
+local arHistory = {}
+local function tickAntiRubberband(dt)
+    if not S.AntiRubberband then return end
+    local r=hrp(); if not r then return end
+    local now = tick()
+    table.insert(arHistory, {t=now, p=r.Position})
+    while #arHistory > 0 and now - arHistory[1].t > 0.8 do
+        table.remove(arHistory, 1)
+    end
+    if #arHistory >= 4 then
+        local recent = arHistory[#arHistory - 1]
+        local backShift = (recent.p - r.Position)
+        if backShift.Magnitude > 12 then
+            -- cancel snapback by re-applying the forward CFrame
+            r.CFrame = CFrame.new(recent.p)
+        end
+    end
+end
+
+----------------------------------------------------------------
+-- stamina (freeze via GetPropertyChangedSignal)
 ----------------------------------------------------------------
 local staminaConns = {}
 local function isStaminaName(n) n=n:lower(); return n:find("stam") or n:find("energy") end
@@ -626,14 +734,14 @@ table.insert(CONN, LP.Idled:Connect(function()
 end))
 
 ----------------------------------------------------------------
--- heartbeat (cheap frame-work only)
+-- heartbeat
 ----------------------------------------------------------------
 table.insert(CONN, RunService.Heartbeat:Connect(function(dt)
-    tickMovement(); tickAntiTaser(dt); tickStamina(dt)
+    tickMovement(dt); tickAntiTaser(dt); tickStamina(dt); tickAntiRubberband(dt)
 end))
 
 ----------------------------------------------------------------
--- slow loop: ESP / meters / noclip apply / loot ops
+-- slow loop
 ----------------------------------------------------------------
 task.spawn(function()
     while gui.Parent do
@@ -641,6 +749,7 @@ task.spawn(function()
         if anyESP then syncESP() elseif next(espByInst) then removeAllHL() end
         updateMeters()
         applyNoclip()
+        if S.SilentWarnings then nukeKickGuis() end
         if S.GrabNearbyLoot then grabNearbyLoot() end
         if S.BringLoot      then bringLoot()      end
         task.wait(ESP_UPDATE_RATE)
@@ -648,8 +757,13 @@ task.spawn(function()
 end)
 
 ----------------------------------------------------------------
--- UI
+-- UI mount
 ----------------------------------------------------------------
+makeToggle("AntiCheat Block",  "AntiCheatBlock")
+makeToggle("Anti Kick",        "AntiKick")
+makeToggle("Anti Rubberband",  "AntiRubberband")
+makeToggle("Silent Warnings",  "SilentWarnings")
+
 makeToggle("Police ESP",       "PoliceESP")
 makeToggle("Guard ESP",        "GuardESP")
 makeToggle("NPC ESP",          "NpcESP")
@@ -662,12 +776,8 @@ makeToggle("Noise Meter",      "NoiseMeter")
 makeToggle("Windows Noclip",   "WindowsNoclip", function(v) if not v then applyNoclip() end end)
 makeToggle("Anti Taser",       "AntiTaser")
 makeToggle("Stealth Mode",     "StealthMode", function(v) setStealth(v) end)
-makeToggle("Speed Boost",      "SpeedBoost", function(v) if v then hookSpeed() end end)
-makeSlider("WalkSpeed", SPEED_MIN, SPEED_MAX, SPEED_VAL, function(val)
-    SPEED_VAL = val
-    local h = hum()
-    if h and S.SpeedBoost then h.WalkSpeed = SPEED_VAL end
-end)
+makeToggle("Speed Boost (velocity)", "SpeedBoost")
+makeSlider("Speed", SPEED_MIN, SPEED_MAX, SPEED_VAL, function(val) SPEED_VAL = val end)
 makeToggle("Inf Stamina",      "InfStamina", function(v) if not v then unhookAllStamina() end end)
 makeToggle("Fall Protection",  "FallProtect")
 makeToggle("Fullbright",       "Fullbright", function(v) setFullbright(v) end)
@@ -688,26 +798,23 @@ makeAction("Teleport To Nearest Loot", function()
     end
     if best and char() then char():PivotTo(best.CFrame * CFrame.new(0, 3, 2)) end
 end)
+makeAction("Wipe AC Connections", wipeACConnections)
 
 ----------------------------------------------------------------
--- respawn
+-- respawn + restore
 ----------------------------------------------------------------
 table.insert(CONN, LP.CharacterAdded:Connect(function(c)
     stealthRestore = {}
     local h=c:WaitForChild("Humanoid", 5)
-    if h then baseSpeed = h.WalkSpeed; hookSpeed() end
+    if h then baseSpeed = h.WalkSpeed end
     task.wait(1)
     if S.StealthMode then setStealth(true) end
     if S.Fullbright  then setFullbright(true) end
 end))
-if hum() then baseSpeed = hum().WalkSpeed; hookSpeed() end
+if hum() then baseSpeed = hum().WalkSpeed end
 
-----------------------------------------------------------------
--- master restore
-----------------------------------------------------------------
 getgenv().__CRIM_SIM_RESTORE = function()
     unhookAllStamina()
-    if speedConn then pcall(function() speedConn:Disconnect() end); speedConn=nil end
     setFullbright(false)
     setStealth(false)
     for p, orig in pairs(glassBackup) do if p and p.Parent then p.CanCollide = orig end end
@@ -715,12 +822,9 @@ getgenv().__CRIM_SIM_RESTORE = function()
     if h then
         h:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
         h:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
-        if h.WalkSpeed == SPEED_VAL then h.WalkSpeed = baseSpeed end
     end
 end
 
-----------------------------------------------------------------
--- do the one-time walk in background so the GUI appears instantly
-----------------------------------------------------------------
 task.spawn(initialWalk)
-print("[crim_sim v6] loaded — press Insert (or End)")
+task.spawn(function() task.wait(2); wipeACConnections() end)
+print("[crim_sim v7] loaded — press Insert (or End)")
