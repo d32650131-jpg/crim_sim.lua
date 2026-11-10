@@ -22,7 +22,9 @@ local S = {
     Fullbright=false, AntiAFK=true,
     GrabNearbyLoot=false, BringLoot=false,
 }
-local SPEED_VAL       = 50
+local SPEED_VAL       = 22     -- live-tunable via slider (default safe-ish for anticheat)
+local SPEED_MIN       = 16
+local SPEED_MAX       = 80
 local ESP_UPDATE_RATE = 0.5    -- how often ESP labels refresh (seconds)
 local ESP_MAX_DIST    = 1500   -- studs; farther objects get no highlight to save GPU
 local GRAB_RADIUS     = 22
@@ -119,6 +121,62 @@ local function makeAction(labelText, cb)
     row.AutoButtonColor=true
     Instance.new("UICorner", row).CornerRadius=UDim.new(0,8)
     row.MouseButton1Click:Connect(function() pcall(cb) end)
+end
+
+local function makeSlider(labelText, minV, maxV, defV, onChange)
+    local row=Instance.new("Frame", scroll)
+    row.Size=UDim2.new(1,-8,0,46); row.BackgroundColor3=Color3.fromRGB(22,25,34); row.BorderSizePixel=0
+    Instance.new("UICorner", row).CornerRadius=UDim.new(0,8)
+
+    local lbl=Instance.new("TextLabel", row)
+    lbl.BackgroundTransparency=1; lbl.Size=UDim2.new(1,-20,0,20); lbl.Position=UDim2.new(0,12,0,2)
+    lbl.Font=Enum.Font.Gotham; lbl.TextSize=12; lbl.TextColor3=Color3.fromRGB(215,218,228)
+    lbl.TextXAlignment=Enum.TextXAlignment.Left
+    lbl.Text = string.format("%s: %d", labelText, defV)
+
+    local track=Instance.new("Frame", row)
+    track.Size=UDim2.new(1,-24,0,8); track.Position=UDim2.new(0,12,0,28)
+    track.BackgroundColor3=Color3.fromRGB(45,50,62); track.BorderSizePixel=0
+    Instance.new("UICorner", track).CornerRadius=UDim.new(1,0)
+
+    local fill=Instance.new("Frame", track)
+    fill.BackgroundColor3=Color3.fromRGB(70,150,255); fill.BorderSizePixel=0
+    fill.Size=UDim2.new((defV-minV)/(maxV-minV), 0, 1, 0)
+    Instance.new("UICorner", fill).CornerRadius=UDim.new(1,0)
+
+    local knob=Instance.new("TextButton", track)
+    knob.Size=UDim2.new(0,14,0,14); knob.AnchorPoint=Vector2.new(0.5,0.5)
+    knob.Position=UDim2.new((defV-minV)/(maxV-minV), 0, 0.5, 0)
+    knob.BackgroundColor3=Color3.fromRGB(235,235,245); knob.AutoButtonColor=false; knob.Text=""
+    Instance.new("UICorner", knob).CornerRadius=UDim.new(1,0)
+
+    local dragging=false
+    local function setFromX(x)
+        local abs = track.AbsolutePosition.X
+        local w   = track.AbsoluteSize.X
+        local a   = math.clamp((x-abs)/w, 0, 1)
+        local val = math.floor(minV + (maxV-minV)*a + 0.5)
+        fill.Size = UDim2.new(a, 0, 1, 0)
+        knob.Position = UDim2.new(a, 0, 0.5, 0)
+        lbl.Text = string.format("%s: %d", labelText, val)
+        if onChange then pcall(onChange, val) end
+    end
+    knob.MouseButton1Down:Connect(function() dragging=true end)
+    track.InputBegan:Connect(function(input)
+        if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
+            dragging=true; setFromX(input.Position.X)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
+            dragging=false
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType==Enum.UserInputType.MouseMovement or input.UserInputType==Enum.UserInputType.Touch) then
+            setFromX(input.Position.X)
+        end
+    end)
 end
 
 local function applyCursor()
@@ -605,6 +663,11 @@ makeToggle("Windows Noclip",   "WindowsNoclip", function(v) if not v then applyN
 makeToggle("Anti Taser",       "AntiTaser")
 makeToggle("Stealth Mode",     "StealthMode", function(v) setStealth(v) end)
 makeToggle("Speed Boost",      "SpeedBoost", function(v) if v then hookSpeed() end end)
+makeSlider("WalkSpeed", SPEED_MIN, SPEED_MAX, SPEED_VAL, function(val)
+    SPEED_VAL = val
+    local h = hum()
+    if h and S.SpeedBoost then h.WalkSpeed = SPEED_VAL end
+end)
 makeToggle("Inf Stamina",      "InfStamina", function(v) if not v then unhookAllStamina() end end)
 makeToggle("Fall Protection",  "FallProtect")
 makeToggle("Fullbright",       "Fullbright", function(v) setFullbright(v) end)
