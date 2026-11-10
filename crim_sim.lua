@@ -596,13 +596,25 @@ local function tickAntiRubberband(dt)
 end
 
 ----------------------------------------------------------------
--- stamina
+-- stamina (aggressive multi-approach)
+--   1. Freeze NumberValues/IntValues named stam/energy/sprint/run via GetPropertyChangedSignal
+--   2. Freeze matching attributes on Player/Char/Humanoid every heartbeat
+--   3. Hook Humanoid.Running (drain usually keys off this)
+--   4. Hunt any 0-100 NumberValue the game created regardless of name (optional aggressive)
 ----------------------------------------------------------------
 local staminaConns = {}
-local function isStaminaName(n) n=n:lower(); return n:find("stam") or n:find("energy") end
+local runningConn
+local function isStaminaName(n)
+    n=n:lower()
+    return n:find("stam") or n:find("energy") or n:find("sprint") or n:find("fatigue") or n:find("endur")
+end
+local function isStaminaAttr(k)
+    k=k:lower()
+    return k:find("stam") or k:find("energy") or k:find("sprint") or k:find("fatigue") or k:find("endur")
+end
 local function hookStaminaValue(v)
     if staminaConns[v] then return end
-    if not (v:IsA("NumberValue") or v:IsA("IntValue")) then return end
+    if not (v:IsA("NumberValue") or v:IsA("IntValue") or v:IsA("NumberConstrainedValue")) then return end
     if not isStaminaName(v.Name) then return end
     local max = (v.MaxValue and v.MaxValue > 0) and v.MaxValue or 100
     v.Value = max
@@ -612,32 +624,65 @@ local function hookStaminaValue(v)
 end
 local function unhookAllStamina()
     for v, c in pairs(staminaConns) do pcall(function() c:Disconnect() end); staminaConns[v]=nil end
+    if runningConn then pcall(function() runningConn:Disconnect() end); runningConn=nil end
 end
-local staminaTick = 0
-local function tickStamina(dt)
-    if not S.InfStamina then return end
-    staminaTick = staminaTick + dt
-    if staminaTick < 0.5 then return end
-    staminaTick = 0
-    for _, v in ipairs(LP:GetDescendants()) do hookStaminaValue(v) end
-    local c = char()
-    if c then
-        for _, v in ipairs(c:GetDescendants()) do hookStaminaValue(v) end
-        for k,_ in pairs(c:GetAttributes()) do
-            local lk=k:lower()
-            if lk:find("stam") or lk:find("energy") then c:SetAttribute(k, 100) end
+
+local function hookHumanoidRunning()
+    if runningConn then return end
+    local h = hum(); if not h then return end
+    -- When the game checks Running speed to drain stamina, slam values up immediately
+    runningConn = h.Running:Connect(function(speed)
+        if not S.InfStamina then return end
+        -- Pump every stamina-like container on the character + player
+        local function pump(obj)
+            for _, v in ipairs(obj:GetDescendants()) do
+                if (v:IsA("NumberValue") or v:IsA("IntValue")) and isStaminaName(v.Name) then
+                    v.Value = (v.MaxValue and v.MaxValue>0) and v.MaxValue or 100
+                end
+            end
+            for k,_ in pairs(obj:GetAttributes()) do
+                if isStaminaAttr(k) then obj:SetAttribute(k, 100) end
+            end
         end
-        local h=c:FindFirstChildOfClass("Humanoid")
+        pcall(pump, LP)
+        local c = char(); if c then pcall(pump, c) end
         if h then
             for k,_ in pairs(h:GetAttributes()) do
-                local lk=k:lower()
-                if lk:find("stam") or lk:find("energy") then h:SetAttribute(k, 100) end
+                if isStaminaAttr(k) then h:SetAttribute(k, 100) end
+            end
+        end
+    end)
+end
+
+local function tickStamina(dt)
+    if not S.InfStamina then return end
+    -- ensure Running hook is live
+    if not runningConn then hookHumanoidRunning() end
+
+    -- Fast path: slam attribute values on player/char/humanoid every frame (cheap)
+    local c = char()
+    for k,_ in pairs(LP:GetAttributes()) do
+        if isStaminaAttr(k) then LP:SetAttribute(k, 100) end
+    end
+    if c then
+        for k,_ in pairs(c:GetAttributes()) do
+            if isStaminaAttr(k) then c:SetAttribute(k, 100) end
+        end
+        local h = c:FindFirstChildOfClass("Humanoid")
+        if h then
+            for k,_ in pairs(h:GetAttributes()) do
+                if isStaminaAttr(k) then h:SetAttribute(k, 100) end
             end
         end
     end
-    for k,_ in pairs(LP:GetAttributes()) do
-        local lk=k:lower()
-        if lk:find("stam") or lk:find("energy") then LP:SetAttribute(k, 100) end
+
+    -- Slow path: hook new values (0.5s)
+    staminaTick = (staminaTick or 0) + dt
+    if staminaTick < 0.5 then return end
+    staminaTick = 0
+    for _, v in ipairs(LP:GetDescendants()) do hookStaminaValue(v) end
+    if c then
+        for _, v in ipairs(c:GetDescendants()) do hookStaminaValue(v) end
     end
 end
 
@@ -792,6 +837,76 @@ makeAction("Teleport To Nearest Loot", function()
     if best and char() then char():PivotTo(best.CFrame * CFrame.new(0, 3, 2)) end
 end)
 makeAction("Wipe AC Connections", wipeACConnections)
+makeAction("DUMP Stamina (console)", function()
+    print("=========== STAMINA DUMP ===========")
+    print("-- Player attributes --")
+    for k,v in pairs(LP:GetAttributes()) do print("  LP.attr", k, "=", v) end
+    local c = char()
+    if c then
+        print("-- Character attributes --")
+        for k,v in pairs(c:GetAttributes()) do print("  Char.attr", k, "=", v) end
+        local h = c:FindFirstChildOfClass("Humanoid")
+        if h then
+            print("-- Humanoid attributes --")
+            for k,v in pairs(h:GetAttributes()) do print("  Hum.attr", k, "=", v) end
+        end
+    end
+    print("-- All NumberValue/IntValue in Player --")
+    for _, v in ipairs(LP:GetDescendants()) do
+        if v:IsA("NumberValue") or v:IsA("IntValue") then
+            print("  LP:", v:GetFullName(), "=", v.Value)
+        end
+    end
+    if c then
+        print("-- All NumberValue/IntValue in Character --")
+        for _, v in ipairs(c:GetDescendants()) do
+            if v:IsA("NumberValue") or v:IsA("IntValue") then
+                print("  Char:", v:GetFullName(), "=", v.Value)
+            end
+        end
+    end
+    print("-- PlayerScripts stam/sprint/energy --")
+    local ps = LP:FindFirstChild("PlayerScripts")
+    if ps then
+        for _, d in ipairs(ps:GetDescendants()) do
+            if d:IsA("LocalScript") or d:IsA("ModuleScript") then
+                local n = d.Name:lower()
+                if n:find("stam") or n:find("sprint") or n:find("energy") or n:find("run") or n:find("fatigue") or n:find("endur") then
+                    print("  script:", d:GetFullName(), "class=", d.ClassName, "disabled=", d:IsA("LocalScript") and d.Disabled or "n/a")
+                end
+            end
+        end
+    end
+    print("-- ReplicatedStorage stamina-ish --")
+    for _, d in ipairs(game:GetService("ReplicatedStorage"):GetDescendants()) do
+        local n = d.Name:lower()
+        if (d:IsA("NumberValue") or d:IsA("IntValue") or d:IsA("RemoteEvent") or d:IsA("RemoteFunction")) then
+            if n:find("stam") or n:find("sprint") or n:find("energy") or n:find("fatigue") then
+                print("  RS:", d.ClassName, d:GetFullName())
+            end
+        end
+    end
+    print("=========== END DUMP ===========")
+end)
+makeAction("KILL Stamina Scripts", function()
+    -- last-resort: disable client LocalScripts whose names strongly suggest stamina drain
+    -- (will NOT touch scripts named Sprint/Crouch control that keep your Shift/Ctrl alive)
+    local ps = LP:FindFirstChild("PlayerScripts"); if not ps then return end
+    local killed = 0
+    for _, d in ipairs(ps:GetDescendants()) do
+        if d:IsA("LocalScript") then
+            local n = d.Name:lower()
+            if n:find("staminahandler") or n:find("staminabar") or n:find("staminadrain")
+                or n:find("staminamanager") or n:find("sprintdrain") or n:find("energydrain")
+                or n:find("staminacontroller") or n:find("fatiguecontroller") then
+                pcall(function() d.Disabled = true end)
+                killed = killed + 1
+                print("[killed]", d:GetFullName())
+            end
+        end
+    end
+    print("killed", killed, "stamina scripts")
+end)
 
 ----------------------------------------------------------------
 -- respawn + restore
