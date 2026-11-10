@@ -9,7 +9,6 @@ local Workspace         = game:GetService("Workspace")
 local Lighting          = game:GetService("Lighting")
 local VirtualUser       = game:GetService("VirtualUser")
 local TweenService      = game:GetService("TweenService")
-local GuiService        = game:GetService("GuiService")
 local StarterGui        = game:GetService("StarterGui")
 
 local LP     = Players.LocalPlayer
@@ -23,8 +22,8 @@ local S = {
     SpeedBoost=false, InfStamina=false, FallProtect=false,
     Fullbright=false, AntiAFK=true,
     GrabNearbyLoot=false, BringLoot=false,
-    -- bypass
-    AntiCheatBlock=true, AntiKick=true, AntiRubberband=false, SilentWarnings=true,
+    -- bypass defaults
+    AntiCheatBlock=false, AntiKick=true, AntiRubberband=false, SilentWarnings=true,
 }
 
 local SPEED_VAL = 28
@@ -35,7 +34,7 @@ local GRAB_RADIUS     = 22
 local BRING_RADIUS    = 400
 
 ----------------------------------------------------------------
--- cleanup prior session
+-- cleanup prior
 ----------------------------------------------------------------
 if getgenv().__CRIM_SIM_GUI then pcall(function() getgenv().__CRIM_SIM_GUI:Destroy() end) end
 if getgenv().__CRIM_SIM_CONN then
@@ -59,18 +58,19 @@ local CAMERA_NAMES = {"camera","cctv","securitycam"}
 local TRUCK_NAMES  = {"truck","van","armored"}
 local TASER_NAMES  = {"taser","stun","shock","tazed","ragdoll"}
 
--- outbound RemoteEvent/RemoteFunction names to swallow (catches CheckSpeed / AntiFly / Report / Detection / ValidatePosition / Telemetry / Heartbeat / AntiExploit variants)
+-- narrow anticheat blocklist — only compound anticheat-specific tokens
+-- won't catch Checkpoint, SprintCheck, TrustFund, BanAnna, AuditLog, etc.
 local AC_BLOCK = {
-    "anticheat","antiexploit","antifly","antispeed","antinoclip","antiteleport",
-    "detect","detection","report","reportclient","reportexploit",
-    "flag","flagplayer","exploitflag",
-    "check","checkspeed","checkposition","checkpos","checkvelocity","walkspeedcheck","speedcheck","poscheck",
-    "validate","validation","validateposition","validatespeed",
-    "kick","kickplayer","forcekick","banplayer","ban","punish","moderation",
-    "trust","integrity","telemetry","heartbeatcheck","sanitycheck",
-    "securitycheck","securityevent","clientcheck","gameguard",
-    "hitcheck","flycheck","noclipcheck","teleportcheck","aimbotcheck",
-    "watchdog","snitch","observer","audit",
+    "anticheat","antiexploit","exploitdetect","exploitreport",
+    "reportexploit","reportcheater","reportclient","reportplayer",
+    "detectexploit","detectcheat","cheatdetect",
+    "flagexploit","flagcheater",
+    "antifly","antinoclip","antiteleport","antispeed",
+    "walkspeedcheck","speedhackcheck","flycheck","noclipcheck","teleportcheck",
+    "validateposition","validatespeed","positionvalidate","speedvalidate",
+    "kickplayer","kickexploit","forcekick","banexploit","banplayer",
+    "sendtelemetry","exploittelemetry","securityreport","securityevent",
+    "gameguard","watchdogreport",
 }
 
 local function matchAny(nameLower, words)
@@ -204,9 +204,7 @@ table.insert(CONN, UserInputService.InputBegan:Connect(function(input, gp)
 end))
 
 ----------------------------------------------------------------
--- __namecall hook: swallow anticheat FireServer/InvokeServer by name,
--- swallow :Kick() calls when AntiKick is on.
--- catches server-side invariant checker, position delta, velocity delta
+-- __namecall hook (only active when AntiCheatBlock/AntiKick on)
 ----------------------------------------------------------------
 local _hookmm = hookmetamethod or (getgenv and getgenv().hookmetamethod)
 local _getnc  = getnamecallmethod or (getgenv and getgenv().getnamecallmethod)
@@ -237,23 +235,23 @@ if _hookmm then
     end)
 end
 
--- also neuter LocalPlayer.Kick via raw-metatable swap (covers games that call it through player instance ref)
+-- neuter LocalPlayer.Kick via raw metatable
 pcall(function()
-    local old_mt = getrawmetatable(LP)
-    if old_mt then
-        setreadonly(old_mt, false)
-        local origIndex = old_mt.__index
-        old_mt.__index = function(t, k)
+    local mt = getrawmetatable(LP)
+    if mt then
+        setreadonly(mt, false)
+        local origIndex = mt.__index
+        mt.__index = function(t, k)
             if k == "Kick" and S.AntiKick then
                 return function() end
             end
             return origIndex(t, k)
         end
-        setreadonly(old_mt, true)
+        setreadonly(mt, true)
     end
 end)
 
--- silence server-sent kick/warn UI
+-- silence server notification popups
 pcall(function()
     local origSet
     origSet = hookfunction(StarterGui.SetCore, function(self, kind, ...)
@@ -264,7 +262,7 @@ pcall(function()
     end)
 end)
 
--- strip any kick-popup GUIs injected by the server
+-- strip kick-popup GUIs the server pushes
 local function nukeKickGuis()
     local pg = LP:FindFirstChildOfClass("PlayerGui"); if not pg then return end
     for _, g in ipairs(pg:GetChildren()) do
@@ -284,13 +282,13 @@ table.insert(CONN, LP:WaitForChild("PlayerGui").ChildAdded:Connect(function(c)
     end
 end))
 
--- kill client-side anticheat connections (watchdog callbacks the game registered on your client)
+-- wipe client-side AC connections (on demand)
 local function wipeACConnections()
     if not getconnections then return end
     local function scan(obj)
         for _, sig in ipairs({"DescendantAdded","ChildAdded","Heartbeat","Stepped","RenderStepped"}) do
-            local s = obj[sig]
-            if typeof(s) == "RBXScriptSignal" then
+            local ok, s = pcall(function() return obj[sig] end)
+            if ok and typeof(s) == "RBXScriptSignal" then
                 for _, con in ipairs(getconnections(s)) do
                     local f = con.Function or con.func
                     local name = ""
@@ -307,7 +305,7 @@ local function wipeACConnections()
 end
 
 ----------------------------------------------------------------
--- cache (event-driven)
+-- CACHE (event-driven)
 ----------------------------------------------------------------
 local setPolice, setGuards, setNpcs = {}, {}, {}
 local setLoot, setCamera, setTruck   = {}, {}, {}
@@ -555,8 +553,7 @@ local function setFullbright(on)
 end
 
 ----------------------------------------------------------------
--- VELOCITY SPEED — WalkSpeed stays at base, we just add velocity in move direction.
--- walkspeed-property check won't fire; velocity-delta checks still might above ~35 — keep slider in 22-32.
+-- velocity speed (walkspeed stays at base)
 ----------------------------------------------------------------
 local baseSpeed = 16
 local function applySpeedEveryFrame()
@@ -578,9 +575,7 @@ local function tickMovement(dt)
 end
 
 ----------------------------------------------------------------
--- ANTI-RUBBERBAND — ring buffer of local positions; if server snaps you back > 12 studs
--- toward a point you were at >0.3s ago, re-apply forward CFrame.
--- defeats naive position-rollback replies from server-side invariant checker.
+-- anti-rubberband
 ----------------------------------------------------------------
 local arHistory = {}
 local function tickAntiRubberband(dt)
@@ -595,14 +590,13 @@ local function tickAntiRubberband(dt)
         local recent = arHistory[#arHistory - 1]
         local backShift = (recent.p - r.Position)
         if backShift.Magnitude > 12 then
-            -- cancel snapback by re-applying the forward CFrame
             r.CFrame = CFrame.new(recent.p)
         end
     end
 end
 
 ----------------------------------------------------------------
--- stamina (freeze via GetPropertyChangedSignal)
+-- stamina
 ----------------------------------------------------------------
 local staminaConns = {}
 local function isStaminaName(n) n=n:lower(); return n:find("stam") or n:find("energy") end
@@ -763,7 +757,6 @@ makeToggle("AntiCheat Block",  "AntiCheatBlock")
 makeToggle("Anti Kick",        "AntiKick")
 makeToggle("Anti Rubberband",  "AntiRubberband")
 makeToggle("Silent Warnings",  "SilentWarnings")
-
 makeToggle("Police ESP",       "PoliceESP")
 makeToggle("Guard ESP",        "GuardESP")
 makeToggle("NPC ESP",          "NpcESP")
@@ -826,5 +819,4 @@ getgenv().__CRIM_SIM_RESTORE = function()
 end
 
 task.spawn(initialWalk)
-task.spawn(function() task.wait(2); wipeACConnections() end)
 print("[crim_sim v7] loaded — press Insert (or End)")
