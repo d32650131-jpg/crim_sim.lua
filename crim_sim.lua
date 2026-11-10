@@ -1,4 +1,4 @@
--- crim_sim.lua  v5 — bugfix pass across all features
+-- crim_sim.lua  v6 — event-driven cache, no more Workspace rescans
 -- loader:
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/d32650131-jpg/crim_sim.lua/main/crim_sim.lua", true))()
 
@@ -22,11 +22,14 @@ local S = {
     Fullbright=false, AntiAFK=true,
     GrabNearbyLoot=false, BringLoot=false,
 }
-local SPEED_VAL = 50
-local SCAN_INTERVAL = 1.2
+local SPEED_VAL       = 50
+local ESP_UPDATE_RATE = 0.5    -- how often ESP labels refresh (seconds)
+local ESP_MAX_DIST    = 1500   -- studs; farther objects get no highlight to save GPU
+local GRAB_RADIUS     = 22
+local BRING_RADIUS    = 400
 
 ----------------------------------------------------------------
--- cleanup prior
+-- cleanup prior session
 ----------------------------------------------------------------
 if getgenv().__CRIM_SIM_GUI then pcall(function() getgenv().__CRIM_SIM_GUI:Destroy() end) end
 if getgenv().__CRIM_SIM_CONN then
@@ -36,6 +39,24 @@ if getgenv().__CRIM_SIM_RESTORE then pcall(getgenv().__CRIM_SIM_RESTORE) end
 getgenv().__CRIM_SIM_CONN = {}
 local CONN = getgenv().__CRIM_SIM_CONN
 for _, c in ipairs(Workspace:GetChildren()) do if c.Name=="__CRIM_ESP" then c:Destroy() end end
+
+----------------------------------------------------------------
+-- helpers
+----------------------------------------------------------------
+local function char() return LP.Character end
+local function hrp() local c=char(); return c and c:FindFirstChild("HumanoidRootPart") end
+local function hum() local c=char(); return c and c:FindFirstChildOfClass("Humanoid") end
+
+local LOOT_NAMES   = {"cashbag","goldbar","safedialing","safe","cash","money","gold","diamond","jewel","bag","loot","bundle","stack","ingot"}
+local GLASS_NAMES  = {"window","glass","pane"}
+local CAMERA_NAMES = {"camera","cctv","securitycam"}
+local TRUCK_NAMES  = {"truck","van","armored"}
+local TASER_NAMES  = {"taser","stun","shock","tazed","ragdoll"}
+
+local function matchAny(nameLower, words)
+    for _, w in ipairs(words) do if nameLower:find(w, 1, true) then return true end end
+    return false
+end
 
 ----------------------------------------------------------------
 -- GUI
@@ -59,7 +80,7 @@ Instance.new("UICorner", header).CornerRadius=UDim.new(0,12)
 local title=Instance.new("TextLabel", header)
 title.BackgroundTransparency=1; title.Size=UDim2.new(1,-20,1,0); title.Position=UDim2.new(0,14,0,0)
 title.Font=Enum.Font.GothamBold; title.TextSize=15; title.TextColor3=Color3.fromRGB(235,235,245)
-title.TextXAlignment=Enum.TextXAlignment.Left; title.Text="CRIM SIM v5   ·   [Insert] toggle"
+title.TextXAlignment=Enum.TextXAlignment.Left; title.Text="CRIM SIM v6   ·   [Insert] toggle"
 
 local scroll=Instance.new("ScrollingFrame", root)
 scroll.Size=UDim2.new(1,-16,1,-58); scroll.Position=UDim2.new(0,8,0,50)
@@ -100,9 +121,6 @@ local function makeAction(labelText, cb)
     row.MouseButton1Click:Connect(function() pcall(cb) end)
 end
 
-----------------------------------------------------------------
--- cursor + Insert
-----------------------------------------------------------------
 local function applyCursor()
     UserInputService.MouseIconEnabled = root.Visible
     UserInputService.ModalEnabled     = root.Visible
@@ -116,85 +134,86 @@ table.insert(CONN, UserInputService.InputBegan:Connect(function(input, gp)
 end))
 
 ----------------------------------------------------------------
--- helpers
+-- EVENT-DRIVEN CACHE (one-time workspace walk, then DescendantAdded hooks)
 ----------------------------------------------------------------
-local function char() return LP.Character end
-local function hrp() local c=char(); return c and c:FindFirstChild("HumanoidRootPart") end
-local function hum() local c=char(); return c and c:FindFirstChildOfClass("Humanoid") end
+-- cache sets: inst -> true
+local setPolice, setGuards, setNpcs = {}, {}, {}
+local setLoot, setCamera, setTruck   = {}, {}, {}
+local glassBackup                    = {}  -- part -> original CanCollide
+local setPrompts                     = {}
 
-local LOOT_NAMES   = {"cashbag","goldbar","safedialing","safe","cash","money","gold","diamond","jewel","bag","loot","bundle","stack","ingot"}
-local GLASS_NAMES  = {"window","glass","pane"}
-local CAMERA_NAMES = {"camera","cctv","securitycam"}
-local TRUCK_NAMES  = {"truck","van","armored"}
-local TASER_NAMES  = {"taser","stun","shock","tazed","ragdoll"}
-
-local function matchAny(name, words)
-    name=name:lower()
-    for _, w in ipairs(words) do if name:find(w, 1, true) then return true end end
-    return false
+local function inFolder(inst, folderName)
+    local f = Workspace:FindFirstChild(folderName)
+    if not f then return false end
+    return inst:IsDescendantOf(f)
 end
-local function getFolder(name) return Workspace:FindFirstChild(name) end
 
-----------------------------------------------------------------
--- cache (only walks known folders + one global pass for loot/glass/prompts)
-----------------------------------------------------------------
-local cache = { police={}, guards={}, npcs={}, loot={}, camera={}, truck={}, glass={}, prompts={}, seen={} }
-
-local function listFromFolder(folder)
-    local t={}
-    if not folder then return t end
-    for _, m in ipairs(folder:GetDescendants()) do
-        if m:IsA("Model") and m:FindFirstChildOfClass("Humanoid") then
-            table.insert(t, m)
+local function classify(inst)
+    if inst:IsA("Model") then
+        if inst:FindFirstChildOfClass("Humanoid") then
+            if inFolder(inst, "Police") then setPolice[inst]=true; return end
+            if inFolder(inst, "Guards") then setGuards[inst]=true; return end
+            if inFolder(inst, "Npcs")   then setNpcs[inst]=true;  return end
         end
+        local n = inst.Name:lower()
+        if matchAny(n, LOOT_NAMES)       then setLoot[inst]=true
+        elseif matchAny(n, CAMERA_NAMES) then setCamera[inst]=true
+        elseif matchAny(n, TRUCK_NAMES)  then setTruck[inst]=true
+        end
+    elseif inst:IsA("BasePart") then
+        local n = inst.Name:lower()
+        if matchAny(n, LOOT_NAMES) then
+            setLoot[inst]=true
+        elseif matchAny(n, GLASS_NAMES) then
+            if glassBackup[inst]==nil then glassBackup[inst] = inst.CanCollide end
+        end
+    elseif inst:IsA("ProximityPrompt") then
+        local p = inst:FindFirstAncestorOfClass("Model") or inst.Parent
+        if p and matchAny(p.Name:lower(), LOOT_NAMES) then setPrompts[inst]=true end
     end
-    return t
 end
-
-local function sweep()
-    cache.police = listFromFolder(getFolder("Police"))
-    cache.guards = listFromFolder(getFolder("Guards"))
-    cache.npcs   = listFromFolder(getFolder("Npcs"))
-
-    cache.loot   = {}
-    cache.camera = {}
-    cache.truck  = {}
-    cache.prompts= {}
-
-    local lootSeen = {}
-    for _, m in ipairs(Workspace:GetDescendants()) do
-        if m:IsA("Model") then
-            local n = m.Name:lower()
-            if matchAny(n, LOOT_NAMES) and not lootSeen[m] then
-                table.insert(cache.loot, m); lootSeen[m]=true
-            elseif matchAny(n, CAMERA_NAMES) then table.insert(cache.camera, m)
-            elseif matchAny(n, TRUCK_NAMES)  then table.insert(cache.truck, m)
-            end
-        elseif m:IsA("BasePart") then
-            local n=m.Name:lower()
-            if matchAny(n, LOOT_NAMES) and not lootSeen[m] then
-                table.insert(cache.loot, m); lootSeen[m]=true
-            elseif matchAny(n, GLASS_NAMES) then
-                if cache.glass[m] == nil then cache.glass[m] = m.CanCollide end
-            end
-        elseif m:IsA("ProximityPrompt") then
-            local p = m:FindFirstAncestorOfClass("Model") or m.Parent
-            if p and matchAny(p.Name, LOOT_NAMES) then
-                table.insert(cache.prompts, m)
-            end
-        end
+local function unclassify(inst)
+    setPolice[inst]=nil; setGuards[inst]=nil; setNpcs[inst]=nil
+    setLoot[inst]=nil;   setCamera[inst]=nil; setTruck[inst]=nil
+    setPrompts[inst]=nil
+    if glassBackup[inst]~=nil then
+        pcall(function() if inst and inst.Parent then inst.CanCollide = glassBackup[inst] end end)
+        glassBackup[inst] = nil
     end
 end
 
+-- initial walk (yields every N instances so no freeze)
+local function initialWalk()
+    local i = 0
+    for _, d in ipairs(Workspace:GetDescendants()) do
+        classify(d)
+        i = i + 1
+        if i % 800 == 0 then task.wait() end
+    end
+end
+
+-- live hooks
+table.insert(CONN, Workspace.DescendantAdded:Connect(function(d)
+    classify(d)
+end))
+table.insert(CONN, Workspace.DescendantRemoving:Connect(function(d)
+    unclassify(d)
+end))
+
 ----------------------------------------------------------------
--- ESP
+-- ESP (incremental, distance-culled)
 ----------------------------------------------------------------
 local espFolder=Instance.new("Folder", Workspace); espFolder.Name="__CRIM_ESP"
-local espByInst = {}
+local espByInst = {}  -- inst -> {hl, bb, color, label}
 
-local function ensureESP(inst, color, label)
-    local rec = espByInst[inst]
-    if rec and rec.hl.Parent then return rec end
+local function getPrimary(inst)
+    if inst:IsA("Model") then return inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart") end
+    if inst:IsA("BasePart") then return inst end
+    return nil
+end
+
+local function addHL(inst, color, label)
+    if espByInst[inst] and espByInst[inst].hl.Parent then return end
     local h=Instance.new("Highlight")
     h.Adornee=inst; h.FillColor=color; h.OutlineColor=color
     h.FillTransparency=0.55; h.OutlineTransparency=0
@@ -207,46 +226,52 @@ local function ensureESP(inst, color, label)
     tl.Font=Enum.Font.GothamBold; tl.TextSize=13; tl.TextColor3=color
     tl.TextStrokeTransparency=0.4; tl.Text=label
     bb.Parent=espFolder
-    rec = {hl=h, bb=bb}; espByInst[inst] = rec
-    return rec
+    espByInst[inst] = {hl=h, bb=bb}
 end
-local function clearESP()
-    for inst, rec in pairs(espByInst) do
+local function removeHL(inst)
+    local rec = espByInst[inst]
+    if rec then
         if rec.hl then rec.hl:Destroy() end
         if rec.bb then rec.bb:Destroy() end
+        espByInst[inst] = nil
     end
-    espByInst = {}
+end
+local function removeAllHL()
+    for inst, _ in pairs(espByInst) do removeHL(inst) end
     for _, c in ipairs(espFolder:GetChildren()) do c:Destroy() end
 end
+
 local function syncESP()
     local wanted = {}
-    local function addList(list, color, label)
-        for _, inst in ipairs(list) do
+    local pos = (hrp() and hrp().Position) or Vector3.new()
+    local function addSet(set, color, label, enabled)
+        if not enabled then return end
+        for inst, _ in pairs(set) do
             if inst and inst.Parent then
-                wanted[inst]=true; ensureESP(inst, color, label)
+                local p = getPrimary(inst)
+                if p and (p.Position - pos).Magnitude <= ESP_MAX_DIST then
+                    wanted[inst] = true
+                    addHL(inst, color, label)
+                end
             end
         end
     end
-    if S.PoliceESP then addList(cache.police, Color3.fromRGB(60,140,255), "POLICE") end
-    if S.GuardESP  then addList(cache.guards, Color3.fromRGB(255,120,80), "GUARD")  end
-    if S.NpcESP    then addList(cache.npcs,   Color3.fromRGB(255,200,80), "NPC")    end
-    if S.LootESP   then addList(cache.loot,   Color3.fromRGB(255,220,70), "LOOT")   end
-    if S.CameraESP then addList(cache.camera, Color3.fromRGB(255,60,160), "CAM")    end
-    if S.TruckESP  then addList(cache.truck,  Color3.fromRGB(120,255,120),"TRUCK")  end
+    addSet(setPolice, Color3.fromRGB(60,140,255), "POLICE", S.PoliceESP)
+    addSet(setGuards, Color3.fromRGB(255,120,80), "GUARD",  S.GuardESP)
+    addSet(setNpcs,   Color3.fromRGB(255,200,80), "NPC",    S.NpcESP)
+    addSet(setLoot,   Color3.fromRGB(255,220,70), "LOOT",   S.LootESP)
+    addSet(setCamera, Color3.fromRGB(255,60,160), "CAM",    S.CameraESP)
+    addSet(setTruck,  Color3.fromRGB(120,255,120),"TRUCK",  S.TruckESP)
 
-    for inst, rec in pairs(espByInst) do
-        if not wanted[inst] then
-            if rec.hl then rec.hl:Destroy() end
-            if rec.bb then rec.bb:Destroy() end
-            espByInst[inst] = nil
-        end
+    for inst, _ in pairs(espByInst) do
+        if not wanted[inst] then removeHL(inst) end
     end
 
     for _, c in ipairs(espFolder:GetChildren()) do if c.Name=="cone" then c:Destroy() end end
     if S.RedViewCones then
-        for _, m in ipairs(cache.police) do
+        for m, _ in pairs(setPolice) do
             local hr=m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
-            if hr then
+            if hr and (hr.Position - pos).Magnitude <= ESP_MAX_DIST then
                 local cone=Instance.new("Part"); cone.Name="cone"
                 cone.Shape=Enum.PartType.Cylinder
                 cone.Size=Vector3.new(60,30,30); cone.Color=Color3.fromRGB(255,40,40)
@@ -274,12 +299,13 @@ local noiseLbl=Instance.new("TextLabel", meterGui)
 noiseLbl.BackgroundTransparency=1; noiseLbl.Size=UDim2.new(1,-16,0,24); noiseLbl.Position=UDim2.new(0,8,0,32)
 noiseLbl.Font=Enum.Font.GothamBold; noiseLbl.TextSize=12; noiseLbl.TextXAlignment=Enum.TextXAlignment.Left
 noiseLbl.TextColor3=Color3.fromRGB(255,180,60); noiseLbl.Text="NOISE      0%"
+
 local function updateMeters()
     meterGui.Visible = S.DetectionMeter or S.NoiseMeter
     detLbl.Visible=S.DetectionMeter; noiseLbl.Visible=S.NoiseMeter
     local r=hrp(); if not r then return end
     local pos=r.Position; local copD=math.huge
-    for _, m in ipairs(cache.police) do
+    for m, _ in pairs(setPolice) do
         local hr=m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
         if hr then local d=(hr.Position-pos).Magnitude; if d<copD then copD=d end end
     end
@@ -290,22 +316,29 @@ end
 ----------------------------------------------------------------
 -- windows noclip
 ----------------------------------------------------------------
+local noclipOn = false
 local function applyNoclip()
     if S.WindowsNoclip then
-        for p, _ in pairs(cache.glass) do if p and p.Parent then p.CanCollide = false end end
-    else
-        for p, orig in pairs(cache.glass) do if p and p.Parent then p.CanCollide = orig end end
+        for p, _ in pairs(glassBackup) do
+            if p and p.Parent and p.CanCollide then p.CanCollide = false end
+        end
+        noclipOn = true
+    elseif noclipOn then
+        for p, orig in pairs(glassBackup) do
+            if p and p.Parent then p.CanCollide = orig end
+        end
+        noclipOn = false
     end
 end
 
 ----------------------------------------------------------------
--- anti-taser (aggressive, no key-breaking script kills)
+-- anti-taser
 ----------------------------------------------------------------
 local atTick = 0
 local function tickAntiTaser(dt)
     if not S.AntiTaser then return end
     atTick = atTick + dt
-    if atTick < 0.2 then return end
+    if atTick < 0.25 then return end
     atTick = 0
     local c = char(); local h = hum(); if not c or not h then return end
 
@@ -318,15 +351,12 @@ local function tickAntiTaser(dt)
     h:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
     h:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
 
-    for _, v in ipairs(c:GetDescendants()) do
-        if v:IsA("Attachment") and matchAny(v.Name, TASER_NAMES) then
-            pcall(function() v:Destroy() end)
-        elseif (v:IsA("BodyGyro") or v:IsA("BodyVelocity") or v:IsA("BodyAngularVelocity")
-             or v:IsA("AngularVelocity") or v:IsA("LinearVelocity") or v:IsA("AlignOrientation")
-             or v:IsA("AlignPosition")) and matchAny(v.Name, TASER_NAMES) then
-            pcall(function() v:Destroy() end)
-        elseif (v:IsA("BoolValue") or v:IsA("NumberValue")) and matchAny(v.Name, TASER_NAMES) then
-            if v:IsA("BoolValue") then v.Value=false else v.Value=0 end
+    for _, v in ipairs(c:GetChildren()) do
+        local n = v.Name:lower()
+        if matchAny(n, TASER_NAMES) then
+            if v:IsA("BoolValue") then v.Value=false
+            elseif v:IsA("NumberValue") then v.Value=0
+            else pcall(function() v:Destroy() end) end
         end
     end
 end
@@ -378,14 +408,14 @@ local function setFullbright(on)
 end
 
 ----------------------------------------------------------------
--- speed boost — hook WalkSpeed so game can't override
+-- speed (hook)
 ----------------------------------------------------------------
 local baseSpeed = 16
 local speedConn
 local function hookSpeed()
     if speedConn then speedConn:Disconnect(); speedConn=nil end
     local h = hum(); if not h then return end
-    baseSpeed = (h.WalkSpeed ~= SPEED_VAL) and h.WalkSpeed or baseSpeed
+    if h.WalkSpeed ~= SPEED_VAL then baseSpeed = h.WalkSpeed end
     speedConn = h:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
         if S.SpeedBoost and h.WalkSpeed ~= SPEED_VAL then
             h.WalkSpeed = SPEED_VAL
@@ -406,13 +436,10 @@ local function tickMovement()
 end
 
 ----------------------------------------------------------------
--- stamina — freeze via GetPropertyChangedSignal, no script kills
+-- stamina
 ----------------------------------------------------------------
 local staminaConns = {}
-local function isStaminaName(n)
-    n = n:lower()
-    return n:find("stam") or n:find("energy")
-end
+local function isStaminaName(n) n=n:lower(); return n:find("stam") or n:find("energy") end
 local function hookStaminaValue(v)
     if staminaConns[v] then return end
     if not (v:IsA("NumberValue") or v:IsA("IntValue")) then return end
@@ -426,14 +453,12 @@ end
 local function unhookAllStamina()
     for v, c in pairs(staminaConns) do pcall(function() c:Disconnect() end); staminaConns[v]=nil end
 end
-
 local staminaTick = 0
 local function tickStamina(dt)
     if not S.InfStamina then return end
     staminaTick = staminaTick + dt
-    if staminaTick < 0.4 then return end
+    if staminaTick < 0.5 then return end
     staminaTick = 0
-
     for _, v in ipairs(LP:GetDescendants()) do hookStaminaValue(v) end
     local c = char()
     if c then
@@ -474,17 +499,17 @@ end
 local function grabNearbyLoot()
     local r=hrp(); if not r then return end
     local pos=r.Position
-    for _, m in ipairs(cache.loot) do
+    for m, _ in pairs(setLoot) do
         if m and m.Parent then
-            local p = m:IsA("Model") and (m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")) or m
-            if p and (p.Position - pos).Magnitude < 22 then triggerOn(m) end
+            local p = getPrimary(m)
+            if p and (p.Position - pos).Magnitude < GRAB_RADIUS then triggerOn(m) end
         end
     end
-    for _, pp in ipairs(cache.prompts) do
+    for pp, _ in pairs(setPrompts) do
         if pp and pp.Parent then
             local pt = pp.Parent
             local part = (pt and pt:IsA("BasePart")) and pt or (pt and pt:FindFirstChildWhichIsA("BasePart"))
-            if part and (part.Position - pos).Magnitude < 22 then
+            if part and (part.Position - pos).Magnitude < GRAB_RADIUS then
                 pcall(fireproximityprompt, pp, 1)
             end
         end
@@ -493,10 +518,10 @@ end
 local function bringLoot()
     local r=hrp(); if not r then return end
     local target = r.CFrame * CFrame.new(0, 2, -4)
-    for _, m in ipairs(cache.loot) do
+    for m, _ in pairs(setLoot) do
         if m and m.Parent then
-            local primary = m:IsA("Model") and (m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")) or m
-            if primary and (primary.Position - r.Position).Magnitude < 400 then
+            local primary = getPrimary(m)
+            if primary and (primary.Position - r.Position).Magnitude < BRING_RADIUS then
                 pcall(function()
                     if primary:IsA("BasePart") and not primary.Anchored then
                         pcall(function() primary:SetNetworkOwner(LP) end)
@@ -543,37 +568,29 @@ table.insert(CONN, LP.Idled:Connect(function()
 end))
 
 ----------------------------------------------------------------
--- heartbeat loop (cheap)
+-- heartbeat (cheap frame-work only)
 ----------------------------------------------------------------
 table.insert(CONN, RunService.Heartbeat:Connect(function(dt)
     tickMovement(); tickAntiTaser(dt); tickStamina(dt)
 end))
 
 ----------------------------------------------------------------
--- slow loop (sweep + ESP + meters + noclip + loot ops)
+-- slow loop: ESP / meters / noclip apply / loot ops
 ----------------------------------------------------------------
 task.spawn(function()
     while gui.Parent do
-        local needScan =
-            S.PoliceESP or S.GuardESP or S.NpcESP or S.LootESP or S.CameraESP or S.TruckESP
-            or S.RedViewCones or S.DetectionMeter
-            or S.WindowsNoclip or S.GrabNearbyLoot or S.BringLoot
-        if needScan then
-            sweep()
-            syncESP()
-            applyNoclip()
-            if S.GrabNearbyLoot then grabNearbyLoot() end
-            if S.BringLoot then bringLoot() end
-        else
-            if next(espByInst) then clearESP() end
-        end
+        local anyESP = S.PoliceESP or S.GuardESP or S.NpcESP or S.LootESP or S.CameraESP or S.TruckESP or S.RedViewCones
+        if anyESP then syncESP() elseif next(espByInst) then removeAllHL() end
         updateMeters()
-        task.wait(SCAN_INTERVAL)
+        applyNoclip()
+        if S.GrabNearbyLoot then grabNearbyLoot() end
+        if S.BringLoot      then bringLoot()      end
+        task.wait(ESP_UPDATE_RATE)
     end
 end)
 
 ----------------------------------------------------------------
--- UI mount
+-- UI
 ----------------------------------------------------------------
 makeToggle("Police ESP",       "PoliceESP")
 makeToggle("Guard ESP",        "GuardESP")
@@ -594,7 +611,6 @@ makeToggle("Fullbright",       "Fullbright", function(v) setFullbright(v) end)
 makeToggle("Anti AFK",         "AntiAFK")
 makeToggle("Grab Nearby Loot", "GrabNearbyLoot")
 makeToggle("Bring Loot",       "BringLoot")
-
 makeAction("Drop Held Loot", dropHeldLoot)
 makeAction("Grab Target Under Cursor", function()
     local t = Mouse.Target
@@ -602,62 +618,36 @@ makeAction("Grab Target Under Cursor", function()
 end)
 makeAction("Teleport To Nearest Loot", function()
     local r=hrp(); if not r then return end
-    sweep()
     local best, bestD = nil, math.huge
-    for _, m in ipairs(cache.loot) do
-        local p = m:IsA("Model") and (m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")) or m
+    for m, _ in pairs(setLoot) do
+        local p = getPrimary(m)
         if p then local d=(p.Position-r.Position).Magnitude; if d<bestD then bestD=d; best=p end end
     end
     if best and char() then char():PivotTo(best.CFrame * CFrame.new(0, 3, 2)) end
 end)
-makeAction("Diagnose Stamina (printout)", function()
-    print("--- Player children ---")
-    for _,v in ipairs(LP:GetChildren()) do print(v.ClassName, v.Name) end
-    print("--- Player attributes ---")
-    for k,v in pairs(LP:GetAttributes()) do print("attr", k, v) end
-    local c=char()
-    if c then
-        print("--- Char attributes ---")
-        for k,v in pairs(c:GetAttributes()) do print("cattr", k, v) end
-        local h=c:FindFirstChildOfClass("Humanoid")
-        if h then
-            print("--- Humanoid attributes ---")
-            for k,v in pairs(h:GetAttributes()) do print("hattr", k, v) end
-        end
-    end
-    print("--- Stamina-like values ---")
-    for _,d in ipairs(game:GetDescendants()) do
-        if d:IsA("NumberValue") or d:IsA("IntValue") then
-            local n=d.Name:lower()
-            if n:find("stam") or n:find("energy") then
-                print("val", d:GetFullName(), "=", d.Value)
-            end
-        end
-    end
-    print("--- done ---")
-end)
 
 ----------------------------------------------------------------
--- respawn hooks + master restore
+-- respawn
 ----------------------------------------------------------------
 table.insert(CONN, LP.CharacterAdded:Connect(function(c)
     stealthRestore = {}
-    for k in pairs(cache.glass) do cache.glass[k] = nil end
     local h=c:WaitForChild("Humanoid", 5)
     if h then baseSpeed = h.WalkSpeed; hookSpeed() end
     task.wait(1)
     if S.StealthMode then setStealth(true) end
     if S.Fullbright  then setFullbright(true) end
 end))
-
 if hum() then baseSpeed = hum().WalkSpeed; hookSpeed() end
 
+----------------------------------------------------------------
+-- master restore
+----------------------------------------------------------------
 getgenv().__CRIM_SIM_RESTORE = function()
     unhookAllStamina()
     if speedConn then pcall(function() speedConn:Disconnect() end); speedConn=nil end
     setFullbright(false)
     setStealth(false)
-    for p, orig in pairs(cache.glass) do if p and p.Parent then p.CanCollide = orig end end
+    for p, orig in pairs(glassBackup) do if p and p.Parent then p.CanCollide = orig end end
     local h=hum()
     if h then
         h:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
@@ -666,4 +656,8 @@ getgenv().__CRIM_SIM_RESTORE = function()
     end
 end
 
-print("[crim_sim v5] loaded — press Insert (or End)")
+----------------------------------------------------------------
+-- do the one-time walk in background so the GUI appears instantly
+----------------------------------------------------------------
+task.spawn(initialWalk)
+print("[crim_sim v6] loaded — press Insert (or End)")
