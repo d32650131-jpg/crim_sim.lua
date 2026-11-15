@@ -1,13 +1,12 @@
--- ANTI-DETECT v4 — multi-axis jitter, aggressive hiding
+-- ANTI-DETECT v5 — horizontal jitter only, no floor clip
 local Players = game:GetService("Players")
 local Run = game:GetService("RunService")
 local SG = game:GetService("StarterGui")
 local LP = Players.LocalPlayer
 
 local DETECT_RADIUS = 35
-local DIP_DEPTH     = 6       -- глубже под землю
-local JITTER_XZ     = 5       -- горизонтальный разброс
-local SCAN_RATE     = 0.03    -- 33Hz, быстрее кадра сервера (обычно 20-30Hz)
+local JITTER_XZ     = 3       -- боковой разброс, безопасный
+local SCAN_RATE     = 0.03
 
 local function notify(t, s)
     pcall(function() SG:SetCore("SendNotification", {Title="ANTI", Text=t, Duration=s or 5}) end)
@@ -27,7 +26,6 @@ local function findEnemyParts()
     return out
 end
 
--- Humanoid-защита
 local BAD = {
     [Enum.HumanoidStateType.Physics]=1,
     [Enum.HumanoidStateType.Ragdoll]=1,
@@ -53,8 +51,8 @@ end
 if LP.Character then protect(LP.Character) end
 LP.CharacterAdded:Connect(protect)
 
--- JITTER DIP: при враге рядом — каждый кадр HRP в случайной точке сферы около baseline-DIP_DEPTH
-local baseline = nil
+-- JITTER только по XZ, Y не трогаем (чтобы не падать)
+local active = false
 task.spawn(function()
     while true do
         task.wait(SCAN_RATE)
@@ -68,33 +66,16 @@ task.spawn(function()
         end
 
         if closest < DETECT_RADIUS then
-            if not baseline then baseline = hrp.CFrame end
-            -- случайное смещение по X/Z + вниз по Y
+            active = true
             local dx = (math.random() - 0.5) * 2 * JITTER_XZ
             local dz = (math.random() - 0.5) * 2 * JITTER_XZ
-            local offset = Vector3.new(dx, -DIP_DEPTH, dz)
-            pcall(function() hrp.CFrame = baseline + offset end)
+            -- только XZ, Y оставляем как есть (не падаем)
+            local pos = hrp.Position
+            pcall(function()
+                hrp.CFrame = CFrame.new(pos.X + dx, pos.Y, pos.Z + dz) * (hrp.CFrame - hrp.CFrame.Position)
+            end)
         else
-            if baseline then
-                pcall(function() hrp.CFrame = baseline end)
-                baseline = nil
-            end
-        end
-    end
-end)
-
--- Baseline отслеживает движение по XZ (чтоб игрок мог ходить)
-task.spawn(function()
-    while true do
-        task.wait(0.2)
-        if baseline then
-            local c = LP.Character
-            local hrp = c and c:FindFirstChild("HumanoidRootPart")
-            if hrp then
-                -- актуальная X/Z (с учётом движения), Y из baseline
-                baseline = CFrame.new(hrp.Position.X, baseline.Position.Y, hrp.Position.Z)
-                    * (baseline - baseline.Position)
-            end
+            active = false
         end
     end
 end)
@@ -126,4 +107,4 @@ LP:WaitForChild("PlayerGui").DescendantAdded:Connect(function(d)
     end
 end)
 
-notify("v4 JITTER: HRP дрожит в радиусе "..JITTER_XZ.."+"..DIP_DEPTH.." при враге", 10)
+notify("v5 XZ-jitter ±"..JITTER_XZ.." при враге в "..DETECT_RADIUS, 10)
