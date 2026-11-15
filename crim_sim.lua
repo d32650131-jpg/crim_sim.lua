@@ -1,51 +1,33 @@
--- ANTI-DETECT v3 — continuous dip, universal NPC scan
+-- ANTI-DETECT v4 — multi-axis jitter, aggressive hiding
 local Players = game:GetService("Players")
 local Run = game:GetService("RunService")
 local SG = game:GetService("StarterGui")
 local LP = Players.LocalPlayer
 
-local DETECT_RADIUS = 30
-local DIP_DEPTH     = 4
-local SCAN_RATE     = 0.05   -- 20Hz
+local DETECT_RADIUS = 35
+local DIP_DEPTH     = 6       -- глубже под землю
+local JITTER_XZ     = 5       -- горизонтальный разброс
+local SCAN_RATE     = 0.03    -- 33Hz, быстрее кадра сервера (обычно 20-30Hz)
 
 local function notify(t, s)
     pcall(function() SG:SetCore("SendNotification", {Title="ANTI", Text=t, Duration=s or 5}) end)
 end
 
--- Один раз — диагностика: что лежит в workspace
-task.spawn(function()
-    task.wait(1)
-    print("=== workspace top-level folders ===")
-    for _,c in ipairs(workspace:GetChildren()) do
-        if c:IsA("Folder") or c:IsA("Model") then
-            local kids = #c:GetChildren()
-            if kids > 0 and kids < 200 then
-                print("  ", c.ClassName, c.Name, "("..kids..")")
-            end
-        end
-    end
-end)
-
--- Универсальный поиск врагов: все модели с Humanoid, кроме игроков, во ВСЁМ workspace
 local function findEnemyParts()
     local out = {}
     for _,m in ipairs(workspace:GetDescendants()) do
         if m:IsA("Humanoid") then
             local model = m.Parent
-            if model and model:IsA("Model") and not Players:GetPlayerFromCharacter(model) then
-                if model ~= LP.Character then
-                    local root = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso") or model:FindFirstChild("UpperTorso") or model.PrimaryPart
-                    if root and root:IsA("BasePart") then
-                        table.insert(out, root)
-                    end
-                end
+            if model and model:IsA("Model") and not Players:GetPlayerFromCharacter(model) and model ~= LP.Character then
+                local root = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso") or model:FindFirstChild("UpperTorso") or model.PrimaryPart
+                if root and root:IsA("BasePart") then table.insert(out, root) end
             end
         end
     end
     return out
 end
 
--- Защита Humanoid
+-- Humanoid-защита
 local BAD = {
     [Enum.HumanoidStateType.Physics]=1,
     [Enum.HumanoidStateType.Ragdoll]=1,
@@ -71,8 +53,8 @@ end
 if LP.Character then protect(LP.Character) end
 LP.CharacterAdded:Connect(protect)
 
--- НЕПРЕРЫВНЫЙ dip: пока враг близко, постоянно держим HRP ниже с восстановлением
-local baseline = nil   -- "честная" позиция (без dip)
+-- JITTER DIP: при враге рядом — каждый кадр HRP в случайной точке сферы около baseline-DIP_DEPTH
+local baseline = nil
 task.spawn(function()
     while true do
         task.wait(SCAN_RATE)
@@ -80,18 +62,19 @@ task.spawn(function()
         local hrp = c:FindFirstChild("HumanoidRootPart"); if not hrp then continue end
 
         local closest = math.huge
-        for _,root in ipairs(findEnemyParts()) do
-            local d = (root.Position - hrp.Position).Magnitude
+        for _,r in ipairs(findEnemyParts()) do
+            local d = (r.Position - hrp.Position).Magnitude
             if d < closest then closest = d end
         end
 
         if closest < DETECT_RADIUS then
-            -- запомнить "честную" позицию если ещё не прячемся
             if not baseline then baseline = hrp.CFrame end
-            -- опустить ниже
-            pcall(function() hrp.CFrame = baseline - Vector3.new(0, DIP_DEPTH, 0) end)
+            -- случайное смещение по X/Z + вниз по Y
+            local dx = (math.random() - 0.5) * 2 * JITTER_XZ
+            local dz = (math.random() - 0.5) * 2 * JITTER_XZ
+            local offset = Vector3.new(dx, -DIP_DEPTH, dz)
+            pcall(function() hrp.CFrame = baseline + offset end)
         else
-            -- враг далеко, вернуть в честную позицию, сбросить baseline
             if baseline then
                 pcall(function() hrp.CFrame = baseline end)
                 baseline = nil
@@ -100,28 +83,27 @@ task.spawn(function()
     end
 end)
 
--- Исправить baseline если игрок двигается (чтобы не телепортило назад)
+-- Baseline отслеживает движение по XZ (чтоб игрок мог ходить)
 task.spawn(function()
     while true do
-        task.wait(0.3)
+        task.wait(0.2)
         if baseline then
             local c = LP.Character
             local hrp = c and c:FindFirstChild("HumanoidRootPart")
             if hrp then
-                -- обновляем X/Z из текущего положения, Y оставляем "честный"
-                local cur = hrp.Position
-                baseline = CFrame.new(cur.X, baseline.Position.Y, cur.Z) * (baseline - baseline.Position)
+                -- актуальная X/Z (с учётом движения), Y из baseline
+                baseline = CFrame.new(hrp.Position.X, baseline.Position.Y, hrp.Position.Z)
+                    * (baseline - baseline.Position)
             end
         end
     end
 end)
 
--- Блок stun-ремоутов
+-- stun-ремоут блок
 local STUN = {"stun","taser","tase","ragdoll","arrest","ko","knock","hospital","catch","capture","handcuff","detect","down"}
-local function match(s, l) s=string.lower(tostring(s)); for _,w in ipairs(l) do if string.find(s,w,1,true) then return true end end return false end
+local function match(s,l) s=string.lower(tostring(s)); for _,w in ipairs(l) do if string.find(s,w,1,true) then return true end end return false end
 pcall(function()
-    local old
-    old = hookmetamethod(game, "__namecall", function(self, ...)
+    local old; old = hookmetamethod(game, "__namecall", function(self, ...)
         local m = getnamecallmethod()
         if typeof(self)=="Instance" and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
             if (m=="FireServer" or m=="InvokeServer") and match(self.Name, STUN) then
@@ -144,10 +126,4 @@ LP:WaitForChild("PlayerGui").DescendantAdded:Connect(function(d)
     end
 end)
 
--- Старт-диагностика после 2 сек
-task.spawn(function()
-    task.wait(2)
-    local e = findEnemyParts()
-    notify("v3 active. Найдено врагов во всей сцене: "..#e, 8)
-    print("[ANTI v3] enemies total:", #e)
-end)
+notify("v4 JITTER: HRP дрожит в радиусе "..JITTER_XZ.."+"..DIP_DEPTH.." при враге", 10)
