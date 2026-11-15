@@ -1,115 +1,184 @@
--- AUTO GOD MODE Criminal Simulator — lobby detect + teleport + auto redeem
+-- GHOST MODE Criminal Simulator — CanQuery hitbox trick + noclip + anti-ragdoll + hover
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
+local Run = game:GetService("RunService")
 local SG = game:GetService("StarterGui")
-local TS = game:GetService("TeleportService")
+local UIS = game:GetService("UserInputService")
 local LP = Players.LocalPlayer
 
-local SCRIPT_URL = "https://raw.githubusercontent.com/d32650131-jpg/crim_sim.lua/main/crim_sim.lua"
+local HOVER_HEIGHT = 80         -- на сколько приподняться (вне LoS охраны)
+local FLY_SPEED = 80
+local DECOY_ENABLED = false     -- false = просто призрак; true = клонировать тело-обманку в сторону
 
 local function notify(t, s)
-    pcall(function() SG:SetCore("SendNotification", {Title="GOD", Text=t, Duration=s or 8}) end)
+    pcall(function() SG:SetCore("SendNotification", {Title="GHOST", Text=t, Duration=s or 5}) end)
 end
 
-local function queueMe()
-    local q = queue_on_teleport or queueonteleport
-        or (syn and syn.queue_on_teleport)
-        or (fluxus and fluxus.queue_on_teleport)
-    if q then
-        pcall(q, 'loadstring(game:HttpGet("'..SCRIPT_URL..'?t="..tick()))()')
-        return true
+-- 1) GHOST — убираем хитбокс для raycast/touch
+local function ghostify(char)
+    for _,p in ipairs(char:GetDescendants()) do
+        if p:IsA("BasePart") then
+            pcall(function()
+                p.CanQuery = false
+                p.CanTouch = false
+                p.CanCollide = false
+                p.Massless = true
+            end)
+        end
     end
+end
+
+-- 2) ANTI-RAGDOLL
+local BAD = {
+    [Enum.HumanoidStateType.Physics]=1,
+    [Enum.HumanoidStateType.Ragdoll]=1,
+    [Enum.HumanoidStateType.FallingDown]=1,
+    [Enum.HumanoidStateType.Dead]=1,
+    [Enum.HumanoidStateType.PlatformStanding]=1,
+    [Enum.HumanoidStateType.Seated]=1,
+}
+local function lockStates(h)
+    for s in pairs(BAD) do pcall(function() h:SetStateEnabled(s, false) end) end
+    h.StateChanged:Connect(function(_,n)
+        if BAD[n] then pcall(function() h:ChangeState(Enum.HumanoidStateType.Running) end) end
+    end)
+end
+
+-- 3) NAMECALL-хук: режем входящие "подними в hospital" и исходящие "I got hit"
+local STUN = {"stun","taser","tase","ragdoll","down","arrest","ko","knock","hospital","detect","catch","capture","handcuff","hurt","damage","teleport"}
+local function match(s, l)
+    s = string.lower(tostring(s))
+    for _,w in ipairs(l) do if string.find(s, w, 1, true) then return true end end
     return false
 end
-
--- Детект: в лобби ли мы (есть ли ремоут Codes)
-local remotes = RS:FindFirstChild("Remotes")
-local codes = remotes and remotes:FindFirstChild("Codes")
-
-if codes and codes:IsA("RemoteFunction") then
-    ------- ЛОББИ: активируем коды -------
-    notify("Лобби найдено. Активирую коды...", 5)
-    local CODES = {"ADMIN","GOD","PIGGY","30KLIKES","10MVISITS","CITY","POLICE"}
-    local results = {}
-    local gotGC = false
-
-    local gcBefore = LP:GetAttribute("GodCharges") or 0
-
-    for _,c in ipairs(CODES) do
-        local ok, r = pcall(function() return codes:InvokeServer(c) end)
-        table.insert(results, c.."="..tostring(r))
-        task.wait(0.4)
-    end
-
-    task.wait(2)  -- даём серверу обновить атрибут
-
-    local gcAfter = LP:GetAttribute("GodCharges") or 0
-    local delta = gcAfter - gcBefore
-
-    print("[CODES]", table.concat(results, " | "))
-    print("[GC]", gcBefore, "->", gcAfter, "delta="..delta)
-
-    if delta > 0 then
-        notify("✓ Получил "..delta.." god зарядов! Всего: "..gcAfter..". Жми God в меню перед раундом", 20)
-    elseif gcAfter > 0 then
-        notify("Коды уже активированы раньше. У тебя "..gcAfter.." зарядов — активируй в меню", 20)
-    else
-        notify("Все коды уже погашены на твоём аккаунте. Только Forever God gamepass (1599R$) даст бессмертие", 20)
-    end
-
-    -- Ищем в UI лобби кнопку God Mode / Immunity и подсвечиваем её
-    task.wait(1)
-    local pg = LP:WaitForChild("PlayerGui")
-    for _,d in ipairs(pg:GetDescendants()) do
-        if (d:IsA("TextButton") or d:IsA("ImageButton")) then
-            local n = string.lower(d.Name or "")
-            local t = d:IsA("TextButton") and string.lower(d.Text or "") or ""
-            if string.find(n,"god") or string.find(t,"god") or string.find(t,"бог") or string.find(t,"иммун") then
-                print("[FOUND GOD BUTTON]", d:GetFullName(), "text:", d.Text)
-                notify("Кнопка God: "..d:GetFullName(), 15)
+pcall(function()
+    local old
+    old = hookmetamethod(game, "__namecall", function(self, ...)
+        local m = getnamecallmethod()
+        if typeof(self) == "Instance" then
+            if (self:IsA("RemoteEvent") or self:IsA("RemoteFunction"))
+                and (m == "FireServer" or m == "InvokeServer")
+                and match(self.Name, STUN) then
+                for _,a in ipairs({...}) do
+                    if a == LP or a == LP.Character then return end
+                end
+            end
+            if m == "TakeDamage" or m == "BreakJoints" or m == "Kill" or m == "ChangeState" then
+                local c = LP.Character
+                if c and self == c:FindFirstChildOfClass("Humanoid") then
+                    if m == "ChangeState" then
+                        local st = ...
+                        if BAD[st] then return end
+                    else return end
+                end
             end
         end
-    end
+        return old(self, ...)
+    end)
+end)
 
-else
-    ------- РАУНД: ставим очередь и телепортим в лобби -------
-    notify("Не в лобби. Очередь поставлена, возвращаюсь в лобби...", 6)
-    local queued = queueMe()
-    if not queued then
-        notify("Executor не поддерживает queue_on_teleport. Выйди в лобби вручную и запусти снова", 15)
-        return
-    end
+-- 4) FLY — WASD в воздухе
+local flyBV, flyBG
+local function startFly(char)
+    local hrp = char:WaitForChild("HumanoidRootPart", 5); if not hrp then return end
+    local h = char:FindFirstChildOfClass("Humanoid"); if h then h.PlatformStand = false end
 
-    -- Пробуем Rejoin remote
-    local rej = remotes and remotes:FindFirstChild("Rejoin")
-    if rej and rej:IsA("RemoteEvent") then
-        pcall(function() rej:FireServer() end)
-        task.wait(2)
-    end
+    if flyBV then pcall(function() flyBV:Destroy() end) end
+    if flyBG then pcall(function() flyBG:Destroy() end) end
 
-    -- Ищем кнопку "В лобби" / "Выйти" / "Return to lobby" в UI
-    local pg = LP:WaitForChild("PlayerGui")
-    local found = false
-    for _,d in ipairs(pg:GetDescendants()) do
-        if d:IsA("TextButton") then
-            local t = string.lower(d.Text or "")
-            local n = string.lower(d.Name or "")
-            if string.find(t,"лобби") or string.find(t,"lobby") or string.find(t,"выйти") or string.find(t,"leave") or string.find(t,"menu") or string.find(n,"lobby") or string.find(n,"leave") then
-                pcall(function()
-                    for _,s in ipairs(getconnections(d.MouseButton1Click)) do s:Fire() end
-                end)
-                found = true
-                notify("Клик: "..d.Text, 5)
-                break
-            end
-        end
-    end
+    flyBV = Instance.new("BodyVelocity")
+    flyBV.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+    flyBV.Velocity = Vector3.new(0, 0, 0)
+    flyBV.Parent = hrp
 
-    -- Fallback: прямой телепорт в универс Criminal Simulator
-    if not found then
-        task.wait(2)
-        pcall(function() TS:Teleport(10769851460, LP) end)
-    end
+    flyBG = Instance.new("BodyGyro")
+    flyBG.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+    flyBG.P = 9000
+    flyBG.CFrame = hrp.CFrame
+    flyBG.Parent = hrp
 
-    notify("Телепорт в лобби... скрипт продолжится там автоматически", 8)
+    Run.RenderStepped:Connect(function()
+        if not flyBV or not flyBV.Parent then return end
+        local cam = workspace.CurrentCamera
+        local move = Vector3.new()
+        if UIS:IsKeyDown(Enum.KeyCode.W) then move = move + cam.CFrame.LookVector end
+        if UIS:IsKeyDown(Enum.KeyCode.S) then move = move - cam.CFrame.LookVector end
+        if UIS:IsKeyDown(Enum.KeyCode.A) then move = move - cam.CFrame.RightVector end
+        if UIS:IsKeyDown(Enum.KeyCode.D) then move = move + cam.CFrame.RightVector end
+        if UIS:IsKeyDown(Enum.KeyCode.Space) then move = move + Vector3.new(0,1,0) end
+        if UIS:IsKeyDown(Enum.KeyCode.LeftControl) then move = move - Vector3.new(0,1,0) end
+        flyBV.Velocity = move * FLY_SPEED
+        flyBG.CFrame = cam.CFrame
+    end)
 end
+
+-- 5) HOVER — поднять автоматом на HOVER_HEIGHT при появлении персонажа
+local function hover(char)
+    task.wait(0.5)
+    local hrp = char:FindFirstChild("HumanoidRootPart"); if not hrp then return end
+    hrp.CFrame = hrp.CFrame + Vector3.new(0, HOVER_HEIGHT, 0)
+end
+
+-- 6) Полная защита персонажа
+local function protect(char)
+    local h = char:WaitForChild("Humanoid", 5); if not h then return end
+    pcall(function() h.BreakJointsOnDeath = false; h.RequiresNeck = false end)
+    lockStates(h)
+    ghostify(char)
+    char.DescendantAdded:Connect(function(p)
+        if p:IsA("BasePart") then
+            pcall(function()
+                p.CanQuery = false; p.CanTouch = false; p.CanCollide = false; p.Massless = true
+            end)
+        end
+    end)
+    -- Motor6D держим целыми (анти-ragdoll через поломку)
+    for _,m in ipairs(char:GetDescendants()) do
+        if m:IsA("Motor6D") then
+            m:GetPropertyChangedSignal("Enabled"):Connect(function()
+                if not m.Enabled then m.Enabled = true end
+            end)
+        end
+    end
+    startFly(char)
+    hover(char)
+end
+
+if LP.Character then protect(LP.Character) end
+LP.CharacterAdded:Connect(protect)
+
+-- 7) GUI-watcher: если даунед всё же вылез — автоклик Продолжить
+LP:WaitForChild("PlayerGui").DescendantAdded:Connect(function(d)
+    task.wait(0.05)
+    if d:IsA("TextButton") then
+        local t = tostring(d.Text or "")
+        if string.find(t, "родолжить") then
+            pcall(function()
+                for _,s in ipairs(getconnections(d.MouseButton1Click)) do s:Fire() end
+            end)
+        end
+    end
+end)
+
+-- 8) Heartbeat: чиним ghostify если сервер пересобирает персонажа
+Run.Heartbeat:Connect(function()
+    local c = LP.Character
+    if c then
+        for _,p in ipairs(c:GetDescendants()) do
+            if p:IsA("BasePart") then
+                if p.CanQuery or p.CanTouch or p.CanCollide then
+                    pcall(function()
+                        p.CanQuery = false; p.CanTouch = false; p.CanCollide = false
+                    end)
+                end
+            end
+        end
+        local h = c:FindFirstChildOfClass("Humanoid")
+        if h and h:GetState() == Enum.HumanoidStateType.Ragdoll then
+            pcall(function() h:ChangeState(Enum.HumanoidStateType.Running) end)
+        end
+    end
+end)
+
+notify("GHOST MODE: пули/лучи не задевают | WASD+Space/Ctrl = fly", 12)
+print("[GHOST] active")
