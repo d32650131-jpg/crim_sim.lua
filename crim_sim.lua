@@ -1,98 +1,115 @@
--- AUTO REDEEM GOD CODE | использует родной UI игры
+-- AUTO GOD MODE Criminal Simulator — lobby detect + teleport + auto redeem
 local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
 local SG = game:GetService("StarterGui")
+local TS = game:GetService("TeleportService")
 local LP = Players.LocalPlayer
 
+local SCRIPT_URL = "https://raw.githubusercontent.com/d32650131-jpg/crim_sim.lua/main/crim_sim.lua"
+
 local function notify(t, s)
-    pcall(function() SG:SetCore("SendNotification", {Title="REDEEM", Text=t, Duration=s or 6}) end)
+    pcall(function() SG:SetCore("SendNotification", {Title="GOD", Text=t, Duration=s or 8}) end)
 end
 
-local CODES_TO_TRY = {"ADMIN","GOD","PIGGY","30KLIKES","10MVISITS"}
-
--- 1) Найти в PlayerGui окно с кодами (ключи: code, promo, код)
-local function findCodesUI()
-    local pg = LP:WaitForChild("PlayerGui")
-    local box, btn, container
-    for _,d in ipairs(pg:GetDescendants()) do
-        if d:IsA("TextBox") then
-            local pname = string.lower(d.Parent.Name or "")
-            local n = string.lower(d.Name or "")
-            local ph = string.lower(d.PlaceholderText or "")
-            if string.find(n,"code") or string.find(pname,"code") or string.find(ph,"код") or string.find(ph,"code") then
-                box = d
-                container = d.Parent
-                -- ищем кнопку рядом
-                for _,sib in ipairs(container:GetDescendants()) do
-                    if sib:IsA("TextButton") then
-                        local t = string.lower(sib.Text or "")
-                        if string.find(t,"redeem") or string.find(t,"активир") or string.find(t,"ввести") or string.find(t,"применить") then
-                            btn = sib; break
-                        end
-                    end
-                end
-                if box and btn then break end
-            end
-        end
-    end
-    return box, btn
-end
-
--- 2) Открыть меню кодов, если закрыто (ищем кнопку CODES/КОДЫ)
-local function openCodesMenu()
-    local pg = LP:WaitForChild("PlayerGui")
-    for _,d in ipairs(pg:GetDescendants()) do
-        if d:IsA("TextButton") or d:IsA("ImageButton") then
-            local n = string.lower(d.Name or "")
-            local t = d:IsA("TextButton") and string.lower(d.Text or "") or ""
-            if string.find(n,"code") or string.find(t,"codes") or string.find(t,"коды") or string.find(t,"код") then
-                pcall(function()
-                    if d:IsA("TextButton") then
-                        for _,s in ipairs(getconnections(d.MouseButton1Click)) do s:Fire() end
-                    else
-                        for _,s in ipairs(getconnections(d.MouseButton1Click)) do s:Fire() end
-                    end
-                end)
-                task.wait(0.4)
-                return true
-            end
-        end
+local function queueMe()
+    local q = queue_on_teleport or queueonteleport
+        or (syn and syn.queue_on_teleport)
+        or (fluxus and fluxus.queue_on_teleport)
+    if q then
+        pcall(q, 'loadstring(game:HttpGet("'..SCRIPT_URL..'?t="..tick()))()')
+        return true
     end
     return false
 end
 
--- 3) Запустить ввод кода
-local function redeem(code)
-    openCodesMenu()
-    task.wait(0.3)
-    local box, btn = findCodesUI()
-    if not box or not btn then return false, "UI not found" end
-    box.Text = code
-    task.wait(0.2)
-    pcall(function()
-        for _,s in ipairs(getconnections(btn.MouseButton1Click)) do s:Fire() end
-    end)
-    task.wait(0.5)
-    return true
-end
+-- Детект: в лобби ли мы (есть ли ремоут Codes)
+local remotes = RS:FindFirstChild("Remotes")
+local codes = remotes and remotes:FindFirstChild("Codes")
 
--- 4) Цикл редем всех кодов
-notify("ищу меню кодов...", 4)
-task.wait(1)
+if codes and codes:IsA("RemoteFunction") then
+    ------- ЛОББИ: активируем коды -------
+    notify("Лобби найдено. Активирую коды...", 5)
+    local CODES = {"ADMIN","GOD","PIGGY","30KLIKES","10MVISITS","CITY","POLICE"}
+    local results = {}
+    local gotGC = false
 
-local results = {}
-for _,c in ipairs(CODES_TO_TRY) do
-    local ok, err = redeem(c)
-    table.insert(results, c.."="..(ok and "sent" or err))
-    task.wait(1)
-    local gc = LP:GetAttribute("GodCharges")
-    print("[REDEEM]", c, "->", ok, err, "| GodCharges=", gc)
-    if type(gc) == "number" and gc > 0 then
-        notify("GOT "..gc.." god charges from "..c, 10)
-        break
+    local gcBefore = LP:GetAttribute("GodCharges") or 0
+
+    for _,c in ipairs(CODES) do
+        local ok, r = pcall(function() return codes:InvokeServer(c) end)
+        table.insert(results, c.."="..tostring(r))
+        task.wait(0.4)
     end
-end
 
-task.wait(1)
-local finalGC = LP:GetAttribute("GodCharges")
-notify("final GodCharges = "..tostring(finalGC)..(finalGC and finalGC>0 and " ✓ активируй God в меню!" or " — коды не дали"), 15)
-print("[REDEEM] results:", table.concat(results, " | "), "| final GC=", finalGC)
+    task.wait(2)  -- даём серверу обновить атрибут
+
+    local gcAfter = LP:GetAttribute("GodCharges") or 0
+    local delta = gcAfter - gcBefore
+
+    print("[CODES]", table.concat(results, " | "))
+    print("[GC]", gcBefore, "->", gcAfter, "delta="..delta)
+
+    if delta > 0 then
+        notify("✓ Получил "..delta.." god зарядов! Всего: "..gcAfter..". Жми God в меню перед раундом", 20)
+    elseif gcAfter > 0 then
+        notify("Коды уже активированы раньше. У тебя "..gcAfter.." зарядов — активируй в меню", 20)
+    else
+        notify("Все коды уже погашены на твоём аккаунте. Только Forever God gamepass (1599R$) даст бессмертие", 20)
+    end
+
+    -- Ищем в UI лобби кнопку God Mode / Immunity и подсвечиваем её
+    task.wait(1)
+    local pg = LP:WaitForChild("PlayerGui")
+    for _,d in ipairs(pg:GetDescendants()) do
+        if (d:IsA("TextButton") or d:IsA("ImageButton")) then
+            local n = string.lower(d.Name or "")
+            local t = d:IsA("TextButton") and string.lower(d.Text or "") or ""
+            if string.find(n,"god") or string.find(t,"god") or string.find(t,"бог") or string.find(t,"иммун") then
+                print("[FOUND GOD BUTTON]", d:GetFullName(), "text:", d.Text)
+                notify("Кнопка God: "..d:GetFullName(), 15)
+            end
+        end
+    end
+
+else
+    ------- РАУНД: ставим очередь и телепортим в лобби -------
+    notify("Не в лобби. Очередь поставлена, возвращаюсь в лобби...", 6)
+    local queued = queueMe()
+    if not queued then
+        notify("Executor не поддерживает queue_on_teleport. Выйди в лобби вручную и запусти снова", 15)
+        return
+    end
+
+    -- Пробуем Rejoin remote
+    local rej = remotes and remotes:FindFirstChild("Rejoin")
+    if rej and rej:IsA("RemoteEvent") then
+        pcall(function() rej:FireServer() end)
+        task.wait(2)
+    end
+
+    -- Ищем кнопку "В лобби" / "Выйти" / "Return to lobby" в UI
+    local pg = LP:WaitForChild("PlayerGui")
+    local found = false
+    for _,d in ipairs(pg:GetDescendants()) do
+        if d:IsA("TextButton") then
+            local t = string.lower(d.Text or "")
+            local n = string.lower(d.Name or "")
+            if string.find(t,"лобби") or string.find(t,"lobby") or string.find(t,"выйти") or string.find(t,"leave") or string.find(t,"menu") or string.find(n,"lobby") or string.find(n,"leave") then
+                pcall(function()
+                    for _,s in ipairs(getconnections(d.MouseButton1Click)) do s:Fire() end
+                end)
+                found = true
+                notify("Клик: "..d.Text, 5)
+                break
+            end
+        end
+    end
+
+    -- Fallback: прямой телепорт в универс Criminal Simulator
+    if not found then
+        task.wait(2)
+        pcall(function() TS:Teleport(10769851460, LP) end)
+    end
+
+    notify("Телепорт в лобби... скрипт продолжится там автоматически", 8)
+end
