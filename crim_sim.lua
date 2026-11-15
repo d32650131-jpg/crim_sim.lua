@@ -1,168 +1,154 @@
--- CRIMINAL SIMULATOR | anti-downed / anti-stun / anti-detect
+-- CRIM SIM FULL DUMP | run, get downed once, send me the file
 local Players = game:GetService("Players")
-local RunSvc  = game:GetService("RunService")
 local RS      = game:GetService("ReplicatedStorage")
+local RunSvc  = game:GetService("RunService")
 local LP      = Players.LocalPlayer
 
-local STUN_WORDS   = {"stun","taser","tase","ragdoll","down","arrest","ko","knock","sleep","hospital","detect","catch","capture","handcuff"}
-local HEALTH_WORDS = {"health","hp","stamina","energy"}
-
-local function match(s, list)
-    s = string.lower(tostring(s))
-    for _,w in ipairs(list) do if string.find(s, w, 1, true) then return true end end
-    return false
+local LOG = {}
+local function log(...)
+    local parts = {}
+    for i,v in ipairs({...}) do parts[i] = tostring(v) end
+    local line = "["..os.date("%H:%M:%S").."] "..table.concat(parts, " | ")
+    table.insert(LOG, line)
+    print(line)
 end
 
--- 1) Блок перехода в стан-состояния Humanoid'а
-local BAD_STATES = {
-    [Enum.HumanoidStateType.Physics]  = true,
-    [Enum.HumanoidStateType.Ragdoll]  = true,
-    [Enum.HumanoidStateType.FallingDown]=true,
-    [Enum.HumanoidStateType.Dead]     = true,
-    [Enum.HumanoidStateType.Seated]   = true,
-    [Enum.HumanoidStateType.PlatformStanding]=true,
-}
-local function lockStates(hum)
-    for state,_ in pairs(BAD_STATES) do
-        pcall(function() hum:SetStateEnabled(state, false) end)
-    end
-    hum.StateChanged:Connect(function(_, new)
-        if BAD_STATES[new] then
-            pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end)
-        end
-    end)
-end
-
--- 2) Защита Motor6D (анти-ragdoll — стан рвёт суставы)
-local function lockMotors(char)
-    for _,m in ipairs(char:GetDescendants()) do
-        if m:IsA("Motor6D") then
-            m:GetPropertyChangedSignal("Enabled"):Connect(function()
-                if not m.Enabled then m.Enabled = true end
-            end)
-        end
-    end
-    char.DescendantAdded:Connect(function(m)
-        if m:IsA("Motor6D") then
-            m:GetPropertyChangedSignal("Enabled"):Connect(function()
-                if not m.Enabled then m.Enabled = true end
-            end)
-        end
-    end)
-end
-
--- 3) Автосброс атрибутов даунеда/стана/детекта
-local function clearBadAttrs(inst)
-    if not inst then return end
-    for k,v in pairs(inst:GetAttributes()) do
-        local lk = string.lower(k)
-        if type(v) == "boolean" and v == true and match(lk, STUN_WORDS) then
-            pcall(function() inst:SetAttribute(k, false) end)
-        end
-        if type(v) == "number" and match(lk, STUN_WORDS) then
-            pcall(function() inst:SetAttribute(k, 0) end)
-        end
-        if type(v) == "number" and match(lk, HEALTH_WORDS) then
-            pcall(function() inst:SetAttribute(k, 100) end)
-        end
+local function flush()
+    if writefile then
+        pcall(function()
+            writefile("crim_sim_dump.txt", table.concat(LOG, "\n"))
+        end)
     end
 end
 
--- 4) Walkspeed/Jump/Stamina держим максимальными
-local SAFE_POS -- последняя безопасная позиция
-local function protectChar(char)
-    local hum = char:WaitForChild("Humanoid", 5); if not hum then return end
-    local hrp = char:WaitForChild("HumanoidRootPart", 5)
-    pcall(function() hum.BreakJointsOnDeath = false end)
-    pcall(function() hum.RequiresNeck = false end)
-    lockStates(hum)
-    task.spawn(function() task.wait(0.5); lockMotors(char) end)
-
-    hum:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
-        if hum.WalkSpeed < 16 then hum.WalkSpeed = 16 end
-    end)
-    hum:GetPropertyChangedSignal("JumpPower"):Connect(function()
-        if hum.JumpPower < 50 then hum.JumpPower = 50 end
-    end)
-
-    -- трекаем "безопасную" позицию каждые 2 сек, когда нас никто не детектит
-    task.spawn(function()
-        while char.Parent do
-            task.wait(2)
-            local detected = false
-            for k,v in pairs(LP:GetAttributes()) do
-                if type(v)=="boolean" and v and match(k, {"detect","wanted","chase"}) then detected=true end
-            end
-            if not detected and hrp then SAFE_POS = hrp.CFrame end
-        end
-    end)
+-- ========== 1) ДЕРЕВО ReplicatedStorage ==========
+log("=== ReplicatedStorage tree ===")
+for _,d in ipairs(RS:GetDescendants()) do
+    if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") or d:IsA("BindableEvent") then
+        log("  ", d.ClassName, d:GetFullName())
+    end
 end
-if LP.Character then protectChar(LP.Character) end
-LP.CharacterAdded:Connect(protectChar)
 
--- 5) Namecall-хук: блок исходящих stun/arrest/damage ремоутов, где аргумент = мы
+-- ========== 2) АТРИБУТЫ игрока и персонажа ==========
+log("=== LP attributes ===")
+for k,v in pairs(LP:GetAttributes()) do log("  LP.attr", k, "=", v, "("..typeof(v)..")") end
+
+local function dumpChar()
+    local c = LP.Character; if not c then return end
+    log("=== Character attributes ===")
+    for k,v in pairs(c:GetAttributes()) do log("  char.attr", k, "=", v, "("..typeof(v)..")") end
+    log("=== Character children ===")
+    for _,ch in ipairs(c:GetChildren()) do
+        log("  child", ch.ClassName, ch.Name)
+    end
+    local h = c:FindFirstChildOfClass("Humanoid")
+    if h then
+        log("=== Humanoid ===")
+        log("  Health=", h.Health, "MaxHealth=", h.MaxHealth, "WalkSpeed=", h.WalkSpeed, "State=", h:GetState())
+    end
+end
+dumpChar()
+
+-- ========== 3) LEADERSTATS / PlayerData ==========
+local function dumpVals(root, prefix)
+    if not root then return end
+    for _,d in ipairs(root:GetDescendants()) do
+        if d:IsA("NumberValue") or d:IsA("IntValue") or d:IsA("StringValue") or d:IsA("BoolValue") then
+            log(" ", prefix, d:GetFullName(), "=", d.Value)
+        end
+    end
+end
+log("=== leaderstats ===")
+dumpVals(LP:FindFirstChild("leaderstats"), "ls")
+for _,n in ipairs({"PlayerData","Data","PlayerStats","Stats"}) do
+    local f = RS:FindFirstChild(n)
+    if f then
+        log("=== RS."..n.." ===")
+        dumpVals(f, n)
+    end
+end
+
+-- ========== 4) ХУК ВСЕХ РЕМОУТОВ ==========
+local function safeStr(v)
+    local ok, s = pcall(function()
+        if typeof(v) == "Instance" then return v.ClassName..":"..v.Name
+        elseif typeof(v) == "table" then
+            local out = {}
+            for k,vv in pairs(v) do table.insert(out, tostring(k).."="..tostring(vv)) end
+            return "{"..table.concat(out,",").."}"
+        else return tostring(v) end
+    end)
+    return ok and s or "?"
+end
+
 pcall(function()
     local old
     old = hookmetamethod(game, "__namecall", function(self, ...)
         local m = getnamecallmethod()
         if typeof(self) == "Instance" and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
-            if (m == "FireServer" or m == "InvokeServer") and match(self.Name, STUN_WORDS) then
-                for _,a in ipairs({...}) do
-                    if a == LP or a == LP.Character then return end
-                end
+            if m == "FireServer" or m == "InvokeServer" then
+                local args = {...}
+                local strs = {}
+                for i,a in ipairs(args) do strs[i] = safeStr(a) end
+                log("OUT", m, self:GetFullName(), "args=", table.concat(strs, ","))
             end
         end
         return old(self, ...)
     end)
 end)
 
--- 6) Глушим входящие события stun/downed
-local function killIncoming(r)
-    if not (r:IsA("RemoteEvent") and match(r.Name, STUN_WORDS)) then return end
-    pcall(function()
-        if getconnections then
-            for _,c in ipairs(getconnections(r.OnClientEvent)) do
-                pcall(function() c:Disable() end)
-            end
-        end
+-- входящие
+for _,r in ipairs(RS:GetDescendants()) do
+    if r:IsA("RemoteEvent") then
+        pcall(function()
+            r.OnClientEvent:Connect(function(...)
+                local args = {...}
+                local strs = {}
+                for i,a in ipairs(args) do strs[i] = safeStr(a) end
+                log("IN ", r:GetFullName(), "args=", table.concat(strs, ","))
+            end)
+        end)
+    end
+end
+
+-- ========== 5) ЛОВИМ СОБЫТИЯ Humanoid'а ==========
+local function watchChar(c)
+    local h = c:WaitForChild("Humanoid", 5); if not h then return end
+    h.HealthChanged:Connect(function(v) log("HP", v, "/", h.MaxHealth) end)
+    h.StateChanged:Connect(function(_, new) log("STATE ->", new.Name) end)
+    h.Died:Connect(function() log("DIED"); flush() end)
+
+    -- слушаем смену ЛЮБЫХ атрибутов на игроке и персонаже
+    LP.AttributeChanged:Connect(function(name)
+        log("LP.attr changed", name, "=", LP:GetAttribute(name))
+    end)
+    c.AttributeChanged:Connect(function(name)
+        log("char.attr changed", name, "=", c:GetAttribute(name))
     end)
 end
-for _,r in ipairs(RS:GetDescendants()) do killIncoming(r) end
-RS.DescendantAdded:Connect(function(r) task.wait(0.1) killIncoming(r) end)
+if LP.Character then watchChar(LP.Character) end
+LP.CharacterAdded:Connect(function(c) task.wait(0.5); dumpChar(); watchChar(c) end)
 
--- 7) GUI-watcher: если показался экран "Вы спустились вниз" — TP на SAFE_POS
+-- ========== 6) ЛОВИМ ПОЯВЛЕНИЕ GUI "Вы спустились" ==========
 LP:WaitForChild("PlayerGui").DescendantAdded:Connect(function(d)
-    task.wait(0.05)
-    if d:IsA("TextLabel") or d:IsA("TextButton") then
+    if d:IsA("TextLabel") then
         local t = tostring(d.Text or "")
-        if string.find(t, "спустились") or string.find(t, "ольниц") or string.find(t, "ozрожден") then
-            -- TP на последнюю безопасную позицию
-            local c = LP.Character
-            if c and c:FindFirstChild("HumanoidRootPart") and SAFE_POS then
-                task.wait(0.1)
-                c.HumanoidRootPart.CFrame = SAFE_POS
-            end
-            -- автоклик "Продолжить"
-            if d:IsA("TextButton") and string.find(t, "родолжить") then
-                pcall(function()
-                    for _,s in ipairs(getconnections(d.MouseButton1Click)) do s:Fire() end
-                end)
-            end
+        if t ~= "" and (#t > 3) then
+            log("GUI text:", d:GetFullName(), "=", t)
         end
     end
 end)
 
--- 8) Heartbeat: чистим все дрянные атрибуты каждый кадр
-RunSvc.Heartbeat:Connect(function()
-    pcall(function()
-        clearBadAttrs(LP)
-        if LP.Character then clearBadAttrs(LP.Character) end
-    end)
+-- ========== 7) АВТОСОХРАНЕНИЕ файла каждые 3 сек ==========
+task.spawn(function()
+    while true do task.wait(3); flush() end
 end)
 
+-- уведомление
 game:GetService("StarterGui"):SetCore("SendNotification", {
-    Title = "CRIM SIM BYPASS",
-    Text  = "anti-stun / anti-downed / safe-TP active",
-    Duration = 6
+    Title = "DUMP ACTIVE",
+    Text  = "иди поймай даунед, потом открой crim_sim_dump.txt",
+    Duration = 8
 })
-print("[CRIM SIM] bypass active")
+log("=== dump started ===")
+flush()
