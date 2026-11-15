@@ -1,35 +1,43 @@
--- ANTI-DETECT Criminal Simulator v2 — tuned, minimal rubberband
+-- ANTI-DETECT v3 — continuous dip, universal NPC scan
 local Players = game:GetService("Players")
 local Run = game:GetService("RunService")
 local SG = game:GetService("StarterGui")
 local LP = Players.LocalPlayer
 
-local DETECT_RADIUS = 25     -- NPC ближе этого → dip
-local DIP_DEPTH     = 3      -- маленький сдвиг, не триггерит rubberband
-local DIP_HOLD      = 0.06   -- 60мс — глаз не замечает
-local SCAN_RATE     = 0.08   -- проверяем 12 раз в секунду
+local DETECT_RADIUS = 30
+local DIP_DEPTH     = 4
+local SCAN_RATE     = 0.05   -- 20Hz
 
 local function notify(t, s)
     pcall(function() SG:SetCore("SendNotification", {Title="ANTI", Text=t, Duration=s or 5}) end)
 end
 
--- 1) Поиск ВСЕХ враждебных NPC: через модели с Humanoid, не-игроков, в папках угроз или по тэгам
-local ENEMY_FOLDERS = {"Guards","Cops","Police","Npcs","NPCs","Enemies","Security","Dogs"}
-local function isEnemy(m)
-    if not m:IsA("Model") then return false end
-    if not m:FindFirstChildOfClass("Humanoid") then return false end
-    if Players:GetPlayerFromCharacter(m) then return false end
-    return true
-end
+-- Один раз — диагностика: что лежит в workspace
+task.spawn(function()
+    task.wait(1)
+    print("=== workspace top-level folders ===")
+    for _,c in ipairs(workspace:GetChildren()) do
+        if c:IsA("Folder") or c:IsA("Model") then
+            local kids = #c:GetChildren()
+            if kids > 0 and kids < 200 then
+                print("  ", c.ClassName, c.Name, "("..kids..")")
+            end
+        end
+    end
+end)
+
+-- Универсальный поиск врагов: все модели с Humanoid, кроме игроков, во ВСЁМ workspace
 local function findEnemyParts()
     local out = {}
-    for _,fname in ipairs(ENEMY_FOLDERS) do
-        local f = workspace:FindFirstChild(fname)
-        if f then
-            for _,m in ipairs(f:GetChildren()) do
-                if isEnemy(m) then
-                    local root = m:FindFirstChild("HumanoidRootPart") or m:FindFirstChild("Torso") or m:FindFirstChild("UpperTorso") or m.PrimaryPart
-                    if root then table.insert(out, root) end
+    for _,m in ipairs(workspace:GetDescendants()) do
+        if m:IsA("Humanoid") then
+            local model = m.Parent
+            if model and model:IsA("Model") and not Players:GetPlayerFromCharacter(model) then
+                if model ~= LP.Character then
+                    local root = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso") or model:FindFirstChild("UpperTorso") or model.PrimaryPart
+                    if root and root:IsA("BasePart") then
+                        table.insert(out, root)
+                    end
                 end
             end
         end
@@ -37,7 +45,7 @@ local function findEnemyParts()
     return out
 end
 
--- 2) Защита Humanoid-состояния
+-- Защита Humanoid
 local BAD = {
     [Enum.HumanoidStateType.Physics]=1,
     [Enum.HumanoidStateType.Ragdoll]=1,
@@ -63,8 +71,8 @@ end
 if LP.Character then protect(LP.Character) end
 LP.CharacterAdded:Connect(protect)
 
--- 3) Dip-цикл
-local dipping = false
+-- НЕПРЕРЫВНЫЙ dip: пока враг близко, постоянно держим HRP ниже с восстановлением
+local baseline = nil   -- "честная" позиция (без dip)
 task.spawn(function()
     while true do
         task.wait(SCAN_RATE)
@@ -77,41 +85,54 @@ task.spawn(function()
             if d < closest then closest = d end
         end
 
-        if closest < DETECT_RADIUS and not dipping then
-            dipping = true
-            local orig = hrp.CFrame
-            pcall(function() hrp.CFrame = orig - Vector3.new(0, DIP_DEPTH, 0) end)
-            task.wait(DIP_HOLD)
-            local nhrp = c:FindFirstChild("HumanoidRootPart")
-            if nhrp then pcall(function() nhrp.CFrame = orig end) end
-            dipping = false
+        if closest < DETECT_RADIUS then
+            -- запомнить "честную" позицию если ещё не прячемся
+            if not baseline then baseline = hrp.CFrame end
+            -- опустить ниже
+            pcall(function() hrp.CFrame = baseline - Vector3.new(0, DIP_DEPTH, 0) end)
+        else
+            -- враг далеко, вернуть в честную позицию, сбросить baseline
+            if baseline then
+                pcall(function() hrp.CFrame = baseline end)
+                baseline = nil
+            end
         end
     end
 end)
 
--- 4) Блок всех stun-related ремоутов (исходящих от нас)
+-- Исправить baseline если игрок двигается (чтобы не телепортило назад)
+task.spawn(function()
+    while true do
+        task.wait(0.3)
+        if baseline then
+            local c = LP.Character
+            local hrp = c and c:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                -- обновляем X/Z из текущего положения, Y оставляем "честный"
+                local cur = hrp.Position
+                baseline = CFrame.new(cur.X, baseline.Position.Y, cur.Z) * (baseline - baseline.Position)
+            end
+        end
+    end
+end)
+
+-- Блок stun-ремоутов
 local STUN = {"stun","taser","tase","ragdoll","arrest","ko","knock","hospital","catch","capture","handcuff","detect","down"}
-local function match(s, l)
-    s = string.lower(tostring(s))
-    for _,w in ipairs(l) do if string.find(s, w, 1, true) then return true end end
-    return false
-end
+local function match(s, l) s=string.lower(tostring(s)); for _,w in ipairs(l) do if string.find(s,w,1,true) then return true end end return false end
 pcall(function()
     local old
     old = hookmetamethod(game, "__namecall", function(self, ...)
         local m = getnamecallmethod()
-        if typeof(self) == "Instance" and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
-            if (m == "FireServer" or m == "InvokeServer") and match(self.Name, STUN) then
-                for _,a in ipairs({...}) do
-                    if a == LP or a == LP.Character then return end
-                end
+        if typeof(self)=="Instance" and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
+            if (m=="FireServer" or m=="InvokeServer") and match(self.Name, STUN) then
+                for _,a in ipairs({...}) do if a==LP or a==LP.Character then return end end
             end
         end
         return old(self, ...)
     end)
 end)
 
--- 5) Автоклик "Продолжить" (бесплатное восстановление вместо R$39)
+-- Автоклик "Продолжить"
 LP:WaitForChild("PlayerGui").DescendantAdded:Connect(function(d)
     task.wait(0.05)
     if d:IsA("TextButton") and string.find(tostring(d.Text or ""), "родолжить") then
@@ -123,31 +144,10 @@ LP:WaitForChild("PlayerGui").DescendantAdded:Connect(function(d)
     end
 end)
 
--- 6) При появлении "заметила/услышал" — экстренный глубокий dip
-LP.PlayerGui.DescendantAdded:Connect(function(d)
-    if d:IsA("TextLabel") then
-        local t = tostring(d.Text or "")
-        if string.find(t, "заметил") or string.find(t, "услышал") then
-            local c = LP.Character
-            local hrp = c and c:FindFirstChild("HumanoidRootPart")
-            if hrp then
-                local orig = hrp.CFrame
-                pcall(function() hrp.CFrame = orig - Vector3.new(0, 10, 0) end)
-                task.wait(0.4)
-                local n = c and c:FindFirstChild("HumanoidRootPart")
-                if n then pcall(function() n.CFrame = orig end) end
-            end
-        end
-    end
-end)
-
--- Диагностика: раз в 5 сек говорим сколько врагов нашли
+-- Старт-диагностика после 2 сек
 task.spawn(function()
     task.wait(2)
-    local enemies = findEnemyParts()
-    notify("ANTI-DETECT active. Враги в сцене: "..#enemies, 8)
-    print("[ANTI] enemies found:", #enemies)
-    for i,e in ipairs(enemies) do
-        if i<=5 then print("  enemy", i, e:GetFullName()) end
-    end
+    local e = findEnemyParts()
+    notify("v3 active. Найдено врагов во всей сцене: "..#e, 8)
+    print("[ANTI v3] enemies total:", #e)
 end)
